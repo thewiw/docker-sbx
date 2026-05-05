@@ -16,7 +16,9 @@ All scripts must be in same directory, and must be run from that directory
 
 This must be done only once.
 
-Run `./docker-sbx-install.sh` and answer the questions.
+First [create a docker account](https://app.docker.com/signup/) if you do not have one already or if you want one for this installation.
+
+Run `./docker-sbx-install.sh` and answer the questions (at one point you will need your docker account).
 
 At the end of installation, all network communication from the sandboxes is prohibited, except for system updates
 
