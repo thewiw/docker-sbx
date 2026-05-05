@@ -30,37 +30,38 @@ Each sandbox is based on 3 main components :
   - a network security policy (shared between all sandboxes, only HTTP, HTTPS and SSH protocols are allowed)
 
 Claude Code has got write access to the whole sandbox filesystem, including the shared volume, so DO NOT STORE CREDENTIALS in this project volume
-For maximum security, the shared volume should only contain source files and CLAUDE.md.
+For maximum security, the shared volume should only contain project files (sources, git, ...) WITHOUT any credentials/certificates/... files.
+For the same reason, sources history (git) MUST NOT contain credentials/certificates/... either (or worst-case scenario if those data exist then they must be obsolete).
 
 ```
 ./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} :
   -n : name of the sandbox, mandatory
-  -p : absolute path of the project's source files, mandatory
+  -p : absolute path of the project's files, mandatory
   -e : path to environment file, optional
 ```
 
-In the end, project's source files should be available within `~/workspace` in the sandbox.
+In the end, project's files should be available within `~/workspace` in the sandbox.
 
 ### Examples
 
-Project is in user's directory user's projects/test01 and source files are in projects/test01/src :
+Project is in user's directory user's projects/test01 :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01/src
-```
-
-Project's source files are in /mnt/c/Users/johndoe/projects/test01/src (WSL) :
-```
-./docker-sbx-create-sandbox.sh -n test01 -p /mnt/c/Users/johndoe/projects/test01/src
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01
 ```
 
-Project's source files are in user's projects/test01/src and Anthropic API key is provided in private/.anthropic.api.env :
+Project's files are in /mnt/c/Users/johndoe/projects/test01 (WSL) :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01/src -e $HOME/private/.anthropic.api.env
+./docker-sbx-create-sandbox.sh -n test01 -p /mnt/c/Users/johndoe/projects/test01
 ```
 
-Project's source files are in user's projects/test01/src and AI backend is an Ollama server running in a container on localhost :
+Project's files are in user's projects/test01 and Anthropic API key is provided in private/.anthropic.api.env :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01/src -e $HOME/private/ollama.local.env
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.anthropic.api.env
+```
+
+Project's files are in user's projects/test01 and AI backend is an Ollama server running in a container on localhost :
+```
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/ollama.local.env
 ```
 
 anthropic.api.env :

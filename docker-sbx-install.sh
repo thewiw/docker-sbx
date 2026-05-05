@@ -93,12 +93,19 @@ install_docker_sbx() {
 
 setup_docker_sbx() {
   sbx policy set-default deny-all # Ensure deny-all is enforced
-  sbx policy deny network "github.com,github.org" # Make it even "surer"
-  sbx policy deny network "gitlab.com,gitlab.org" # Make it even "surer"
-  sbx policy deny network "atlassian.com,atlassian.net,bitbucket.com,bitbucket.org" # Make it even "surer"
-  sbx policy deny network "postman.com" # Make it even "surer"
-  sbx policy allow network "archive.ubuntu.com,security.ubuntu.com,download.docker.com" # sandbox is allowed to do system updates
-  #sbx policy allow network "host.docker.internal" # sandox is allowed to access local docker containers
+
+  # sandbox is allowed to do system updates
+  sbx policy allow network "archive.ubuntu.com,security.ubuntu.com,download.docker.com"
+
+  # deny some sites "by name", to make it even "surer" (in case default policy is changed later)
+  sbx policy deny network "github.com,github.org"
+  sbx policy deny network "gitlab.com,gitlab.org"
+  sbx policy deny network "atlassian.com,atlassian.net,bitbucket.com,bitbucket.org"
+  sbx policy deny network "postman.com"
+
+  # sandbox is allowed to use inference sites
+  #sbx policy allow network "api.anthropic.com" # allow Anthropic API
+  #sbx policy allow network "host.docker.internal" # allow local docker containers
 }
 
 check_root_privileges
