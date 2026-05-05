@@ -63,15 +63,15 @@ Project's files are in user's projects/test01 and Anthropic API key is provided 
 
 Project's files are in user's projects/test01 and AI backend is an Ollama server running in a container on localhost :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/ollama.local.env
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.ollama.local.env
 ```
 
-anthropic.api.env :
+.anthropic.api.env :
 ```
 ANTHROPIC_API_KEY=...
 ```
 
-ollama.local.env :
+.ollama.local.env :
 ```
 ANTHROPIC_BASE_URL=http://host.docker.internal:11434
 ANTHROPIC_AUTH_TOKEN=ollama
