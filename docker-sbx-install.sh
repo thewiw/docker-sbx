@@ -108,8 +108,13 @@ setup_docker_sbx() {
   #sbx policy allow network "host.docker.internal" # allow local docker containers
 }
 
+setup_env() {
+  echo "export SBX_NO_TELEMETRY=1" >> ~/.bashrc
+}
+
 check_root_privileges
 query_install_docker
 install_docker
 install_docker_sbx
 setup_docker_sbx
+setup_env
