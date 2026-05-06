@@ -50,32 +50,34 @@ install_docker() {
   echo "════════════════════════════════════════════════════════"
   echo "⚙️  ocker installation in progress, please be patient..."
   echo "════════════════════════════════════════════════════════"
- 
+
   # Clean former or alternative Docker
   sudo apt remove $(dpkg --get-selections docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc | cut -f1)
 
   # Add Docker's official GPG key:
-  sudo apt update
-  sudo apt install ca-certificates curl
+  sudo apt update -y
+  sudo apt install ca-certificates curl -y
   sudo install -m 0755 -d /etc/apt/keyrings
   sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
   sudo chmod a+r /etc/apt/keyrings/docker.asc
 
   # Add the repository to Apt sources:
   filepath=/etc/apt/sources.list.d/docker.sources
+  suites=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+  archs=$(dpkg --print-architecture)
   sudo rm $filepath 2> /dev/null
   sudo touch $filepath
-  sudo echo 'Types: deb' 2> $filepath
-  sudo echo 'URIs: https://download.docker.com/linux/ubuntu' 2> $filepath
-  sudo echo 'Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")' 2> $filepath
-  sudo echo 'Components: stable' 2> $filepath
-  sudo echo 'Architectures: $(dpkg --print-architecture)' 2> $filepath
-  sudo echo 'Signed-By: /etc/apt/keyrings/docker.asc' 2> $filepath
+  sudo echo "Types: deb" >> $filepath
+  sudo echo "URIs: https://download.docker.com/linux/ubuntu" >> $filepath
+  sudo echo "Suites: ${suites}" >> $filepath
+  sudo echo "Components: stable" >> $filepath
+  sudo echo "Architectures: ${archs}" >> $filepath
+  sudo echo "Signed-By: /etc/apt/keyrings/docker.asc" >> $filepath
 
-  sudo apt update
+  sudo apt update -y
 
   # Install Docker
-  sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
 }
 
 install_docker_sbx() {
@@ -84,7 +86,7 @@ install_docker_sbx() {
   echo "════════════════════════════════════════════════════════════════════"
 
   curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
-  sudo apt-get install docker-sbx
+  sudo apt-get install docker-sbx -y
   sudo usermod -aG kvm $USER
   newgrp kvm
   sbx policy set-default deny-all # Set default policy before login
