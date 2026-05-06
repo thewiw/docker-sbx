@@ -1,10 +1,12 @@
 #!/bin/bash
 
+curuser="${SUDO_USER}"
+
 check_root_privileges() {
   if [[ $EUID -ne 0 ]]; then
-      echo "════════════════════════════════════════════════════"
-      echo "⛔ Error: This script must be run as root (use sudo)"
-      echo "════════════════════════════════════════════════════"
+      echo "══════════════════════════════════════════════════"
+      echo "Error: This script must be run as root (use sudo)"
+      echo "══════════════════════════════════════════════════"
       exit 1
   fi
 }
@@ -17,28 +19,29 @@ query_install_docker() {
     DOCKER_PATH=$(command -v docker)
     DOCKER_VER=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "inconnue")
 
-    echo "═══════════════════════════════════════════════════════"
-    echo "⚠️  LLERT  : Docker is already installed on this system"
-    echo "📍 Binary  : $DOCKER_PATH"
-    echo "📦 Version : $DOCKER_VER"
-    echo "═══════════════════════════════════════════════════════"
+    echo ""
+    echo "════════════════════════════════════════════════════"
+    echo "ALERT   : Docker is already installed on this system"
+    echo "Binary  : $DOCKER_PATH"
+    echo "Version : $DOCKER_VER"
+    echo "════════════════════════════════════════════════════"
     echo ""
 
     # ⏱️ Ptnteractive prompt
-    echo "⚠️BBEWARE Current docker installation will be removed, including all images and containers !!!"
+    echo "BEWARE Current docker installation will be removed, including all images and containers !!!"
     if ! read -r -p "🔍 Do you still want to continue the installation [y/N] " RESPONSE; then
-      echo "⏱️  Timeout or bad input. Installation canceled."
+      echo "Timeout or bad input. Installation canceled."
       echo ""
       exit 1
     fi
 
     case "${RESPONSE,,}" in
       o|y|yes|oui)
-        echo "✅ Installation authorized. Continuing installation...\n"
+        echo "Installation authorized. Continuing installation...\n"
         echo ""
         ;;
       *)
-        echo "❌ Installation canceled by user."
+        echo "Installation canceled by user."
         echo ""
         exit 1
         ;;
@@ -47,9 +50,10 @@ query_install_docker() {
 }
 
 install_docker() {
-  echo "════════════════════════════════════════════════════════"
-  echo "⚙️  ocker installation in progress, please be patient..."
-  echo "════════════════════════════════════════════════════════"
+  echo ""
+  echo "═════════════════════════════════════════════════════"
+  echo "Docker installation in progress, please be patient..."
+  echo "═════════════════════════════════════════════════════"
 
   # Clean former or alternative Docker
   sudo apt remove $(dpkg --get-selections docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc | cut -f1)
@@ -81,38 +85,43 @@ install_docker() {
 }
 
 install_docker_sbx() {
-  echo "════════════════════════════════════════════════════════════════════"
-  echo "⚙️  oocker sandboxes installation in progress, please be patient..."
-  echo "════════════════════════════════════════════════════════════════════"
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "Docker sandboxes installation in progress, please be patient..."
+  echo "═══════════════════════════════════════════════════════════════"
 
   curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
   sudo apt-get install docker-sbx -y
-  sudo usermod -aG kvm $USER
-  newgrp kvm
-  sbx policy set-default deny-all # Set default policy before login
-  sbx login
+  sudo usermod -aG kvm "${curuser}"
+  su - "${curuser}" <<-EOFSBX
+    sg kvm -c 'sbx login'
+EOFSBX
 }
 
 setup_docker_sbx() {
-  sbx policy set-default deny-all # Ensure deny-all is enforced
+  su - "${curuser}" <<-EOFSBX
+    # ensure deny-all is enforced
+    sg kvm -c 'sbx policy set-default deny-all'
 
-  # sandbox is allowed to do system updates
-  sbx policy allow network "archive.ubuntu.com,security.ubuntu.com,download.docker.com"
+    # sandbox is allowed to do system updates
+    sg kvm -c 'sbx policy allow network "archive.ubuntu.com,security.ubuntu.com,download.docker.com"'
 
-  # deny some sites "by name", to make it even "surer" (in case default policy is changed later)
-  sbx policy deny network "github.com,github.org"
-  sbx policy deny network "gitlab.com,gitlab.org"
-  sbx policy deny network "atlassian.com,atlassian.net,bitbucket.com,bitbucket.org"
-  sbx policy deny network "postman.com"
+    # deny some sites "by name", to make it even "surer" (in case default policy is changed later)
+    sg kvm -c 'sbx policy deny network "github.com,github.org"'
+    sg kvm -c 'sbx policy deny network "gitlab.com,gitlab.org"'
+    sg kvm -c 'sbx policy deny network "atlassian.com,atlassian.net,bitbucket.com,bitbucket.org"'
+    sg kvm -c 'sbx policy deny network "postman.com"'
 
-  # sandbox is allowed to use inference sites
-  #sbx policy allow network "api.anthropic.com" # allow Anthropic API
-  #sbx policy allow network "host.docker.internal" # allow local docker containers
+    # sandbox is allowed to use inference sites
+    #sg kvm -c 'sbx policy allow network "api.anthropic.com"' # allow Anthropic API
+    #sg kvm -c 'sbx policy allow network "host.docker.internal"' # allow local docker containers
+EOFSBX
 }
 
 setup_env() {
   echo "export SBX_NO_TELEMETRY=1" >> ~/.bashrc
 }
+
 
 check_root_privileges
 query_install_docker
@@ -120,3 +129,10 @@ install_docker
 install_docker_sbx
 setup_docker_sbx
 setup_env
+
+echo ""
+echo "═════════════════════════════════════════════════════════════════════════════════════════"
+echo "Installation should be done, it is recommended to logout/login for changes to take effect"
+echo "═════════════════════════════════════════════════════════════════════════════════════════"
+echo ""
+
