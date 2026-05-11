@@ -49,11 +49,13 @@ check_project_secrets_git() {
     gitrepo="$path/.git"
   elif gitdir=$(find "$path" -type d -name .git -print -quit 2>/dev/null); then
     gitrepo="$gitdir"
+  else
+    gitrepo="$path"
   fi
 
   if [ -n "$gitrepo" ]; then
-    echo "GIT repository found at ${gitrepo}, running leaks detection, please wait..."
-    if ! docker run --rm -v "$gitrepo":/repo -v "$(pwd)":/report ghcr.io/gitleaks/gitleaks:latest detect --source /repo --report-path /report/report.json; then
+    echo "Detecting secrets within GIT repository ${gitrepo}, please wait..."
+    if ! docker run --rm -v "$path":/project -v "$gitrepo":/repo -v "$(pwd)":/report ghcr.io/gitleaks/gitleaks:latest git /repo --gitleaks-ignore-path /project --report-path "/report/${name}_gitleaks.json"; then
       echo "Error: detected at least 1 leak in git repository ${gitrepo}, fix it/them before running sandbox"
       echo ""
       exit 1
