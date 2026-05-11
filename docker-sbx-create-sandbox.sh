@@ -31,7 +31,7 @@ usage() {
 check_project_secrets_files() {
   echo "Looking for secrets files in $path, please wait..."
 
-  secrets=`find "$path" -type f \( -name "google-services.json" -o -name "key.properties" \)`
+  secrets=`find "$path" -type f \( -name "google-services.json" -o -name "key.properties" -o -name "*.jks" \)`
   if echo "$secrets" 2> /dev/null | grep -q .; then
     echo "$secrets"
     echo "Error: secrets file(s) detected within this project, make sure those can not be reached from sandbox and run this command again"
