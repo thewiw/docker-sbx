@@ -1,13 +1,13 @@
 # Docker SBX
 
-Tools to install Docker Sandboxes engine + create and manage sandboxes
+Tools to install Docker Sandboxes engine + create and manage AI Agent sandboxes
 
 Work in progress !!!
 Use at your own risk !!!
 
 Based on [Docker Sandboxes](https://docs.docker.com/reference/cli/sbx/)
 
-Tested on WSL running Ubuntu 24.04 LTS
+Tested on WSL Ubuntu
 
 All scripts must be in same directory, and must be run from that directory
 
@@ -36,10 +36,11 @@ For maximum security, the shared volume should only contain project files (sourc
 For the same reason, sources history (git) MUST NOT contain credentials/certificates/... either (or worst-case scenario if those data exist then they must be obsolete).
 
 ```
-./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} :
+./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} :
   -n : name of the sandbox, mandatory
   -p : absolute path of the project's files, mandatory
   -e : path to environment file, optional
+  -s : check secrets, optional and true by default
 ```
 
 In the end, project's files should be available within `~/workspace` in the sandbox.
