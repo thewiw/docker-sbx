@@ -31,7 +31,6 @@ usage() {
 check_project_secrets_files() {
   echo "Looking for secrets files in $path, please wait..."
 
-  #secrets=`find "$path" -type d \( -path ./node_modules -o -path ./bower_components \) -prune -type f \( -name "google-services.json" -o -name "key.properties" -o -name "*.jks" -o -name "*.crt" -o -name "*.cert" -o -name "*.key" \)`
   secrets=`find "$path" -type f \( -name "google-services.json" -o -name "key.properties" -o -name "*.jks" -o -name "*.cert" -o -name "*.crt" -o -name "*.key" \) -not -path "*/node_modules/*" -not -path "*/bower_components/*"`
   if echo "$secrets" 2> /dev/null | grep -q .; then
     echo "$secrets"
