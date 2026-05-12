@@ -7,7 +7,11 @@ Use at your own risk !!!
 
 Based on [Docker Sandboxes](https://docs.docker.com/reference/cli/sbx/)
 
-Tested on WSL Ubuntu
+Tested on :
+
+  - WSL Ubuntu 24.04 LTS
+
+  - Ubuntu 26.04 LTS
 
 All scripts must be in same directory, and must be run from that directory
 
