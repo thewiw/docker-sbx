@@ -103,18 +103,18 @@ setup_docker_sbx() {
     # ensure deny-all is enforced
     sg kvm -c 'sbx policy set-default deny-all'
 
-    # sandbox is allowed to do system updates
-    sg kvm -c 'sbx policy allow network "archive.ubuntu.com,security.ubuntu.com,download.docker.com"'
+    # sandboxes are allowed to do system updates
+    sg kvm -c 'sbx policy allow network -g "archive.ubuntu.com,security.ubuntu.com,download.docker.com"'
 
     # deny some sites "by name", to make it even "surer" (in case default policy is changed later)
-    sg kvm -c 'sbx policy deny network "github.com,github.org"'
-    sg kvm -c 'sbx policy deny network "gitlab.com,gitlab.org"'
-    sg kvm -c 'sbx policy deny network "atlassian.com,atlassian.net,bitbucket.com,bitbucket.org"'
-    sg kvm -c 'sbx policy deny network "postman.com"'
+    sg kvm -c 'sbx policy deny network -g "github.com,github.org"'
+    sg kvm -c 'sbx policy deny network -g "gitlab.com,gitlab.org"'
+    sg kvm -c 'sbx policy deny network -g "atlassian.com,atlassian.net,bitbucket.com,bitbucket.org"'
+    sg kvm -c 'sbx policy deny network -g "postman.com"'
 
-    # sandbox is allowed to use inference sites
-    #sg kvm -c 'sbx policy allow network "api.anthropic.com"' # allow Anthropic API
-    #sg kvm -c 'sbx policy allow network "host.docker.internal"' # allow local docker containers
+    # Note (DO NOT UNCOMMENT) : allow specific sandboxes to use some sites
+    # sbx policy allow network [sandbox name] "api.anthropic.com" # allow Anthropic API
+    # sbx policy allow network [sandbox name] "host.docker.internal" # allow local docker containers
 EOFSBX
 }
 
