@@ -106,7 +106,7 @@ setup_sandbox() {
   echo ""
 
   sbx cp ./docker-sbx-setup-sandbox.sh "$name":../setup-sandbox.sh
-  sbx exec -ti "$name" chmod 755 ../setup-sandbox.sh
+  sbx exec -ti "$name" sudo chmod 755 ../setup-sandbox.sh
   if [[ -z "$envfile" ]]; then
     sbx exec -ti "$name" bash ../setup-sandbox.sh "$path"
   else

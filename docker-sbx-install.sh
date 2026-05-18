@@ -91,7 +91,7 @@ install_docker_sbx() {
   echo "═══════════════════════════════════════════════════════════════"
 
   curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
-  sudo apt-get install docker-sbx -y
+  sudo apt-get install util-linux-extra docker-sbx -y
   sudo usermod -aG kvm "${curuser}"
   su - "${curuser}" <<-EOFSBX
     sg kvm -c 'sbx login'
@@ -115,6 +115,7 @@ setup_docker_sbx() {
     # Note (DO NOT UNCOMMENT) : allow specific sandboxes to use some sites
     # sbx policy allow network [sandbox name] "api.anthropic.com" # allow Anthropic API
     # sbx policy allow network [sandbox name] "host.docker.internal" # allow local docker containers
+    # sbx policy allow network [sandbox name] "{specific ip or specific hostname or specific domain}" # allow some specific machines
 EOFSBX
 }
 
