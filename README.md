@@ -1,15 +1,13 @@
 # Docker SBX
 
-Tools to install Docker Sandboxes engine + create and manage AI Agent sandboxes
+Tools to install [Docker Sandboxes](https://docs.docker.com/reference/cli/sbx/) engine + create and manage AI Agent sandboxes
 
 Work in progress !!!
 Use at your own risk !!!
 
-Based on [Docker Sandboxes](https://docs.docker.com/reference/cli/sbx/)
-
 Tested on :
 
-  - WSL Ubuntu 24.04 LTS
+  - WSL Ubuntu 24.04 LTS and Ubuntu 26.04 LTS
 
   - Ubuntu 26.04 LTS
 
@@ -26,6 +24,7 @@ Run `./docker-sbx-install.sh` and answer the questions (at one point you will ne
 
 At the end of installation, all network communication from the sandboxes is prohibited, except for system updates
 
+
 ## Create a sandbox
 
 This must be done each time a new sandbox must be created.
@@ -36,7 +35,9 @@ Each sandbox is based on 3 main components :
   - a network security policy (shared between all sandboxes, only HTTP, HTTPS and SSH protocols are allowed)
 
 Claude Code has got write access to the whole sandbox filesystem, including the shared volume, so DO NOT STORE CREDENTIALS in this project volume
+
 For maximum security, the shared volume should only contain project files (sources, git, ...) WITHOUT any credentials/certificates/... files.
+
 For the same reason, sources history (git) MUST NOT contain credentials/certificates/... either (or worst-case scenario if those data exist then they must be obsolete).
 
 ```
@@ -68,23 +69,29 @@ Project's files are in user's projects/test01 and Anthropic API key is provided 
 
 Project's files are in user's projects/test01 and AI backend is an Ollama server running in a container on localhost :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.ollama.local.env
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.ollama.srv.env
 ```
 
 .anthropic.api.env :
 ```
-ANTHROPIC_API_KEY=...
+ANTHROPIC_API_KEY=[your anthropic API key]
 ```
 
-.ollama.local.env :
+.anthropic.auth.env :
 ```
-ANTHROPIC_BASE_URL=http://host.docker.internal:11434
+ANTHROPIC_AUTH_TOKEN=[your anthropic account token]
+```
+
+.ollama.srv.env :
+```
+ANTHROPIC_BASE_URL=http{s}://[ollama host]{:[ollama port]}
 ANTHROPIC_AUTH_TOKEN=ollama
 ```
 
-In case of using a local ollama, make sure to allow its domain in network policy, for above example the command would be :
+Example for locally dockerized ollama server with port 11434:
 ```
-sbx policy allow network host.docker.internal
+ANTHROPIC_BASE_URL=http://host.docker.internal:11434
+ANTHROPIC_AUTH_TOKEN=ollama
 ```
 
 

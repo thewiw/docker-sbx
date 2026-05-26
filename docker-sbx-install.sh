@@ -82,6 +82,8 @@ install_docker() {
 
   # Install Docker
   sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+
+  sudo usermod -aG docker "${curuser}"
 }
 
 install_docker_sbx() {
@@ -136,4 +138,3 @@ echo "════════════════════════�
 echo "Installation should be done, it is recommended to logout/login for changes to take effect"
 echo "═════════════════════════════════════════════════════════════════════════════════════════"
 echo ""
-

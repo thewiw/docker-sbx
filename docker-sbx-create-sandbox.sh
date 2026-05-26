@@ -115,6 +115,37 @@ setup_sandbox() {
   fi
 }
 
+update_sbx_policy() {
+  if [[ -z "$envfile" || ! -f "$envfile" ]]; then
+    return 0
+  fi
+
+  local base_url=""
+  local api_key=""
+
+  if grep -q '^ANTHROPIC_BASE_URL=' "$envfile" 2>/dev/null; then
+    base_url=$(grep '^ANTHROPIC_BASE_URL=' "$envfile" | cut -d '=' -f 2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  fi
+
+  if grep -q '^ANTHROPIC_API_KEY=' "$envfile" 2>/dev/null; then
+    api_key=$(grep '^ANTHROPIC_API_KEY=' "$envfile" | cut -d '=' -f 2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
+  fi
+
+  if [[ -n "$base_url" ]]; then
+    local allowed_host
+    allowed_host=$(echo "$base_url" | sed -E 's|https?://||; s|[:/].*||')
+    echo ""
+    echo "Allowing $allowed_host in sandbox $name network policy"
+    sbx policy allow network "$name" "$allowed_host"
+  fi
+
+  if [[ -n "$api_key" ]]; then
+    echo ""
+    echo "Allowing api.anthropic.com in sandbox $name network policy"
+    sbx policy allow network "$name" "api.anthropic.com"
+  fi
+}
+
 while getopts ":n:p:e:s:h" opt; do
     case "$opt" in
         n) name="$OPTARG";;
@@ -137,3 +168,4 @@ fi
 check_project_secrets
 create_sandbox
 setup_sandbox
+update_sbx_policy
