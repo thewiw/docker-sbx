@@ -9,36 +9,101 @@ name=""
 path=""
 envfile=""
 secrets="true"
+secretsfile=""
+gensecretsfile=""
 
 usage() {
   scriptname=`basename "$0"`
-  echo "Usage: $scriptname -n [sandbox name] -p [project path] -e [sandbox env file] -s [check secrets]"
+  echo "Usage: $scriptname -n [sandbox name] -p [project path] -e [sandbox env file] -s [check secrets] -sf [secrets config file]"
   echo "Options:"
   echo "  -n string     Define the name of the new sandbox [mandatory]"
   echo "  -p string     Absolute path of project's directory [mandatory]"
   echo "  -e string     Env file [optional]"
   echo "  -s true/false Check for secrets (default true)"
+  echo "  -sf string    Secrets config JSON file [optional]"
+  echo "  -gsf string   Generate a default secrets config JSON file and exit"
   echo ""
   echo "  -h, --help Show this help and exit"
   echo ""
   echo "Example(s):"
   echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test"
   echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test -e sbx.env"
+  echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test -e sbx.env -sf secrets.json"
+  echo "  from WSL : $scriptname -gsf secrets.json"
   echo ""
   exit 1
 }
 
-check_project_secrets_files() {
-  echo "Looking for secrets files in $path, please wait..."
+generate_secrets_file() {
+  local filepath="$gensecretsfile"
+  cat > "$filepath" << 'EOF'
+{
+  "search": [
+    "google-services.json",
+    "key.properties",
+    "*.jks",
+    "*.cert",
+    "*.crt",
+    "*.key"
+  ],
+  "avoid": [
+    ".venv",
+    "node_modules",
+    "bower_components"
+  ]
+}
+EOF
+  echo "Generated default secrets config file: $filepath"
+}
 
-  secrets=`find "$path" -type f \( -name "google-services.json" -o -name "key.properties" -o -name "*.jks" -o -name "*.cert" -o -name "*.crt" -o -name "*.key" \) -not -path "*/node_modules/*" -not -path "*/bower_components/*"`
-  if echo "$secrets" 2> /dev/null | grep -q .; then
-    echo "$secrets"
-    echo "Error: secrets file(s) detected within this project, make sure those can not be reached from sandbox and run this command again"
+check_project_secrets_files() {
+  local search_patterns=()
+  local avoid_patterns=()
+
+  if [[ -n "$secretsfile" && -f "$secretsfile" ]]; then
+    readarray -t search_patterns < <(python3 -c "import json; data=json.load(open('$secretsfile')); [print(p) for p in data.get('search', [])]")
+    readarray -t avoid_patterns < <(python3 -c "import json; data=json.load(open('$secretsfile')); [print(p) for p in data.get('avoid', [])]")
+  else
+    search_patterns=("google-services.json" "key.properties" "*.jks" "*.cert" "*.crt" "*.key")
+    avoid_patterns=(".venv" "node_modules" "bower_components")
+  fi
+
+  if [[ ${#search_patterns[@]} -eq 0 ]]; then
+    echo "Not searching for secrets files, let's continue"
+    echo ""
+    return 0
+  else
+    echo "Looking for secrets files in $path, please wait..."
+  fi
+
+  local find_args=("$path" -type f)
+
+  local name_args=()
+  for pattern in "${search_patterns[@]}"; do
+    if [[ ${#name_args[@]} -gt 0 ]]; then
+      name_args+=(-o)
+    fi
+    name_args+=(-name "$pattern")
+  done
+
+  if [[ ${#name_args[@]} -gt 0 ]]; then
+    find_args+=("(" "${name_args[@]}" ")")
+  fi
+
+  for dir in "${avoid_patterns[@]}"; do
+    find_args+=(-not -path "*/$dir/*")
+  done
+
+  #echo "find args = ${find_args[@]}"
+  secrets_found=`find "${find_args[@]}"`
+
+  if echo "$secrets_found" 2> /dev/null | grep -q .; then
+    echo "$secrets_found"
+    echo "Error: secrets files detected within this project, make sure those can not be reached from sandbox and run this command again"
     echo ""
     exit 1
   else
-    echo "No secrets file detected within this project, let's continue"
+    echo "No secrets files detected within this project, let's continue"
     echo ""
   fi
 }
@@ -146,15 +211,56 @@ update_sbx_policy() {
   fi
 }
 
-while getopts ":n:p:e:s:h" opt; do
-    case "$opt" in
-        n) name="$OPTARG";;
-        p) path="$OPTARG";;
-        e) envfile="$OPTARG";;
-        s) secrets="$OPTARG";;
-        h) usage;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n)
+            name="$2"
+            shift 2
+            ;;
+        -p)
+            path="$2"
+            shift 2
+            ;;
+        -e)
+            envfile="$2"
+            shift 2
+            ;;
+        -s)
+            secrets="$2"
+            shift 2
+            ;;
+        -sf)
+            secretsfile="$2"
+            shift 2
+            ;;
+        -gsf)
+            gensecretsfile="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
     esac
 done
+
+if [[ -n "$gensecretsfile" ]]; then
+    gsf_dir=$(dirname "$gensecretsfile")
+    if [[ ! -d "$gsf_dir" ]]; then
+        echo "Error: directory '$gsf_dir' does not exist"
+        exit 1
+    fi
+    generate_secrets_file
+    exit 0
+fi
+
+if [[ -n "$secretsfile" && ! -f "$secretsfile" ]]; then
+    echo "Error: secrets config file '$secretsfile' not found"
+    exit 1
+fi
 
 if [[ -z "$name" || -z "$path" ]]; then
   echo ""
