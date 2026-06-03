@@ -196,18 +196,21 @@ update_sbx_policy() {
     api_key=$(grep '^ANTHROPIC_API_KEY=' "$envfile" | cut -d '=' -f 2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
   fi
 
-  if [[ -n "$base_url" ]]; then
+  if [[ -n "$base_url" ]]; then # LLM server hostname is provided
     local allowed_host
     allowed_host=$(echo "$base_url" | sed -E 's|https?://||; s|[:/].*||')
     echo ""
     echo "Allowing $allowed_host in sandbox $name network policy"
     sbx policy allow network "$name" "$allowed_host"
-  fi
-
-  if [[ -n "$api_key" ]]; then
+  else if [[ -n "$api_key" ]]; then # Using Anthropic API key
     echo ""
     echo "Allowing api.anthropic.com in sandbox $name network policy"
     sbx policy allow network "$name" "api.anthropic.com"
+  else # Using Anthropic regular login method
+    echo ""
+    echo "Allowing claude.ai and platform.claude.com in sandbox $name network policy"
+    sbx policy allow network "$name" "claude.ai"
+    sbx policy allow network "$name" "platform.claude.com"
   fi
 }
 
