@@ -202,7 +202,7 @@ update_sbx_policy() {
     echo ""
     echo "Allowing $allowed_host in sandbox $name network policy"
     sbx policy allow network "$name" "$allowed_host"
-  else if [[ -n "$api_key" ]]; then # Using Anthropic API key
+  elif [[ -n "$api_key" ]]; then # Using Anthropic API key
     echo ""
     echo "Allowing api.anthropic.com in sandbox $name network policy"
     sbx policy allow network "$name" "api.anthropic.com"
