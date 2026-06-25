@@ -164,19 +164,21 @@ create_sandbox() {
 }
 
 setup_sandbox() {
+  sbxhome="/home/agent"
+
   echo ""
   echo "════════════════"
   echo "Updating sandbox $name"
   echo "════════════════"
   echo ""
 
-  sbx cp ./docker-sbx-setup-sandbox.sh "$name":../setup-sandbox.sh
-  sbx exec -ti "$name" sudo chmod 755 ../setup-sandbox.sh
+  sbx cp ./docker-sbx-setup-sandbox.sh "$name":"$sbxhome/setup-sandbox.sh"
+  sbx exec -ti "$name" sudo chmod 755 "$sbxhome/setup-sandbox.sh"
   if [[ -z "$envfile" ]]; then
-    sbx exec -ti "$name" bash ../setup-sandbox.sh "$path"
+    sbx exec -ti "$name" bash "$sbxhome/setup-sandbox.sh" "$path"
   else
     echo "Using env file $envfile"
-    sbx exec -ti --env-file "$envfile" "$name" bash ../setup-sandbox.sh "$path"
+    sbx exec -ti --env-file "$envfile" "$name" bash "$sbxhome/setup-sandbox.sh" "$path"
   fi
 }
 
@@ -201,16 +203,16 @@ update_sbx_policy() {
     allowed_host=$(echo "$base_url" | sed -E 's|https?://||; s|[:/].*||')
     echo ""
     echo "Allowing $allowed_host in sandbox $name network policy"
-    sbx policy allow network "$name" "$allowed_host"
+    sbx policy allow network --sandbox "$name" "$allowed_host"
   elif [[ -n "$api_key" ]]; then # Using Anthropic API key
     echo ""
     echo "Allowing api.anthropic.com in sandbox $name network policy"
-    sbx policy allow network "$name" "api.anthropic.com"
+    sbx policy allow network --sandbox "$name" "api.anthropic.com"
   else # Using Anthropic regular login method
     echo ""
     echo "Allowing claude.ai and platform.claude.com in sandbox $name network policy"
-    sbx policy allow network "$name" "claude.ai"
-    sbx policy allow network "$name" "platform.claude.com"
+    sbx policy allow network --sandbox "$name" "claude.ai"
+    sbx policy allow network --sandbox "$name" "platform.claude.com"
   fi
 }
 
