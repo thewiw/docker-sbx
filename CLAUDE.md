@@ -27,15 +27,16 @@ All scripts must remain in the same directory and are run from that directory.
 ## Creating a Sandbox
 
 ```bash
-./docker-sbx-create-sandbox.sh -n <sandbox-name> -p <absolute-project-path> [-e <env-file>] [-s true|false]
+./docker-sbx-create-sandbox.sh -n <sandbox-name> -p <absolute-project-path> [-e <env-file>] [-s true|false] [-v <path>...]
 ```
 
 - `-n` sandbox name (mandatory)
 - `-p` absolute path to the project directory (mandatory)
 - `-e` path to an environment file passed into the sandbox (optional)
 - `-s` whether to scan for secrets, default `true` (optional)
+- `-v` absolute path to an extra host directory or file to mount into the sandbox (optional, repeatable). The mount is **read-only by default**; append `:rw` to mount read-write (or `:ro` to be explicit). Each path is mounted inside the sandbox at the same absolute path it has on the host.
 
-Project files will be available at `~/workspace` inside the sandbox.
+Project files will be available at `~/workspace` inside the sandbox. Extra volumes passed via `-v` are reachable at their own absolute host paths.
 
 ## Environment Files
 

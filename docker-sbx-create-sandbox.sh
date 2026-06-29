@@ -11,6 +11,8 @@ envfile=""
 secrets="true"
 secretsfile=""
 gensecretsfile=""
+volumes=()
+volume_args=()
 
 usage() {
   scriptname=`basename "$0"`
@@ -22,6 +24,9 @@ usage() {
   echo "  -s true/false Check for secrets (default true)"
   echo "  -sf string    Secrets config JSON file [optional]"
   echo "  -gsf string   Generate a default secrets config JSON file and exit"
+  echo "  -v path       Mount an extra host directory/file into the sandbox (absolute path)."
+  echo "                Repeat -v for multiple mounts. Read-only by default; append :rw to"
+  echo "                mount read-write (or :ro to be explicit). e.g. -v /mnt/c/docs -v /mnt/c/data:rw"
   echo ""
   echo "  -h, --help Show this help and exit"
   echo ""
@@ -29,6 +34,7 @@ usage() {
   echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test"
   echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test -e sbx.env"
   echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test -e sbx.env -sf secrets.json"
+  echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test -v /mnt/c/docs -v /mnt/c/data:rw"
   echo "  from WSL : $scriptname -gsf secrets.json"
   echo ""
   exit 1
@@ -152,6 +158,46 @@ check_project_secrets() {
   fi
 }
 
+build_volume_args() {
+  volume_args=()
+  if [[ ${#volumes[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  local spec hostpath mode low
+  for spec in "${volumes[@]}"; do
+    # An optional trailing :ro / :rw suffix selects the mount mode.
+    # Without a suffix the volume is mounted read-only (the default).
+    low="${spec,,}"
+    mode="ro"
+    hostpath="$spec"
+    if [[ "$low" == *:ro ]]; then
+      mode="ro"
+      hostpath="${spec:0:-3}"
+    elif [[ "$low" == *:rw ]]; then
+      mode="rw"
+      hostpath="${spec:0:-3}"
+    fi
+
+    if [[ "$hostpath" != /* ]]; then
+      echo "Error: volume path '$hostpath' must be an absolute path"
+      exit 1
+    fi
+    if [[ ! -e "$hostpath" ]]; then
+      echo "Error: volume path '$hostpath' does not exist"
+      exit 1
+    fi
+
+    if [[ "$mode" == "ro" ]]; then
+      volume_args+=("${hostpath}:ro")
+    else
+      volume_args+=("$hostpath")
+    fi
+    echo "Mounting $hostpath (read-$([[ $mode == ro ]] && echo only || echo write)) into sandbox $name"
+  done
+  echo ""
+}
+
 create_sandbox() {
   prjname=`basename "$path"`
 
@@ -160,11 +206,15 @@ create_sandbox() {
   echo "Creating sandbox $name"
   echo "════════════════"
   echo ""
-  sbx create --name "$name" claude "$path"
+  if [[ ${#volume_args[@]} -gt 0 ]]; then
+    sbx create --name "$name" claude "$path" "${volume_args[@]}"
+  else
+    sbx create --name "$name" claude "$path"
+  fi
 }
 
 setup_sandbox() {
-  sbxhome="/home/agent"
+  sbx_home="/home/agent"
 
   echo ""
   echo "════════════════"
@@ -172,13 +222,13 @@ setup_sandbox() {
   echo "════════════════"
   echo ""
 
-  sbx cp ./docker-sbx-setup-sandbox.sh "$name":"$sbxhome/setup-sandbox.sh"
-  sbx exec -ti "$name" sudo chmod 755 "$sbxhome/setup-sandbox.sh"
+  sbx cp ./docker-sbx-setup-sandbox.sh "$name":"$sbx_home/setup-sandbox.sh"
+  sbx exec -ti "$name" sudo chmod 755 "$sbx_home/setup-sandbox.sh"
   if [[ -z "$envfile" ]]; then
-    sbx exec -ti "$name" bash "$sbxhome/setup-sandbox.sh" "$path"
+    sbx exec -ti "$name" bash "$sbx_home/setup-sandbox.sh" "$path"
   else
     echo "Using env file $envfile"
-    sbx exec -ti --env-file "$envfile" "$name" bash "$sbxhome/setup-sandbox.sh" "$path"
+    sbx exec -ti --env-file "$envfile" "$name" bash "$sbx_home/setup-sandbox.sh" "$path"
   fi
 }
 
@@ -242,6 +292,10 @@ while [[ $# -gt 0 ]]; do
             gensecretsfile="$2"
             shift 2
             ;;
+        -v)
+            volumes+=("$2")
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -276,6 +330,7 @@ if [[ -z "$name" || -z "$path" ]]; then
   usage
 fi
 
+build_volume_args
 check_project_secrets
 create_sandbox
 setup_sandbox
