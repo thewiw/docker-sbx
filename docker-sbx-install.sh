@@ -122,7 +122,9 @@ EOFSBX
 }
 
 setup_env() {
-  echo "export SBX_NO_TELEMETRY=1" >> ~/.bashrc
+  echo 'export SBX_NO_TELEMETRY=1' >> ~/.bashrc
+  echo 'export LANG="C.utf8"' >> ~/.bashrc
+  echo 'export LC_ALL="C.utf8"' >> ~/.bashrc
 }
 
 

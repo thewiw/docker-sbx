@@ -1,4 +1,5 @@
 prjpath=$1
+envfilepath=${2:-}
 
 stop_apt() {
   sleep 5
@@ -69,13 +70,47 @@ set_env_if_missing() {
     return 0
 }
 
+load_env_file() {
+    # Source the env file passed in from the host (copied into the sandbox by
+    # docker-sbx-create-sandbox.sh) so its variables are available to
+    # update_claude_code_settings regardless of whether `sbx exec --env-file`
+    # propagated them. Only KEY=VALUE assignments are honoured; blank lines and
+    # lines starting with '#' are skipped (matching docker --env-file semantics,
+    # so an inline '#' stays part of the value).
+    if [[ -z "$envfilepath" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$envfilepath" ]]; then
+        printf 'Warning: env file "%s" not found, skipping\n' "$envfilepath"
+        return 0
+    fi
+
+    printf 'Loading env file: %s\n' "$envfilepath"
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == "#"* ]] && continue
+        if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            export "$line"
+        fi
+    done < "$envfilepath"
+}
+
+cleanup_env_file() {
+    # The env file may contain credentials; remove the in-sandbox copy once the
+    # settings have been written. Claude Code reads these from settings.json.
+    if [[ -n "$envfilepath" && -f "$envfilepath" ]]; then
+        rm -f "$envfilepath"
+    fi
+}
+
 update_claude_code_settings() {
   targetjson=~/.claude/settings.json
-  tmpjson="$(mktemp "${targetJson}.tmp.XXXXXX" )" || exit 1
+  tmpjson="$(mktemp "${targetjson}.tmp.XXXXXX" )" || exit 1
 
   set_env_if_missing DISABLE_TELEMETRY "1"
   set_env_if_missing CLAUDE_CODE_ENABLE_TELEMETRY "0"
-  set_env_if_missing CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY "1"
+  set_env_if_missing CLAUDE_CODE_DISABLE_TELEMETRY "1"
   set_env_if_missing CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC "1"
   set_env_if_missing CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY "1"
 
@@ -131,9 +166,18 @@ setup_path() {
   ln -s "$prjpath" ./workspace
 }
 
+setup_env() {
+  echo 'export SBX_NO_TELEMETRY=1' >> ~/.bashrc
+  echo 'export LANG="C.utf8"' >> ~/.bashrc
+  echo 'export LC_ALL="C.utf8"' >> ~/.bashrc
+}
+
 echo "Project path: $prjpath"
 
+load_env_file
 stop_apt
 install_tools
 update_claude_code_settings
+cleanup_env_file
 setup_path
+setup_env

@@ -228,7 +228,10 @@ setup_sandbox() {
     sbx exec -ti "$name" bash "$sbx_home/setup-sandbox.sh" "$path"
   else
     echo "Using env file $envfile"
-    sbx exec -ti --env-file "$envfile" "$name" bash "$sbx_home/setup-sandbox.sh" "$path"
+    envbasename="$(basename "$envfile")"
+    sbx cp "$envfile" "$name":"$sbx_home/$envbasename"
+    sbx exec -ti "$name" sudo chmod 644 "$sbx_home/$envbasename"
+    sbx exec -ti "$name" bash "$sbx_home/setup-sandbox.sh" "$path" "$sbx_home/$envbasename"
   fi
 }
 
