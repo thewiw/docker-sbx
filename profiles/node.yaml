@@ -1,0 +1,10 @@
+name: node
+description: Node.js/npm/Yarn package resolution
+policies:
+  network:
+    allow:
+      - registry.npmjs.org
+      - npmjs.org
+      - yarnpkg.com
+      - registry.yarnpkg.com
+      - pnpm.io

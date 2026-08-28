@@ -1,0 +1,7 @@
+name: rust
+description: Rust crate resolution (Cargo)
+policies:
+  network:
+    allow:
+      - crates.io
+      - static.crates.io

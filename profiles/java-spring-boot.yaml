@@ -1,0 +1,14 @@
+name: java-spring-boot
+description: Java + Spring Boot dependency resolution and project generation
+policies:
+  network:
+    allow:
+      - repo.maven.apache.org
+      - repo1.maven.org
+      - plugins.gradle.org
+      - services.gradle.org
+      - repo.gradle.org
+      - jcenter.bintray.com
+      - start.spring.io
+      - repo.spring.io
+      - maven.springframework.org

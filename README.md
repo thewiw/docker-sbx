@@ -41,13 +41,15 @@ For maximum security, the shared volume should only contain project files (sourc
 For the same reason, sources history (git) MUST NOT contain credentials/certificates/... either (or worst-case scenario if those data exist then they must be obsolete).
 
 ```
-./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} :
-  -n   : name of the sandbox [[mandatory]]
-  -p   : absolute path of the project's files [[mandatory]]
-  -e   : path to environment file [[optional]]
-  -s   : check secrets [[optional, true by default]]
-  -sf  : path to secrets files settings [[optional, uses default settings if missing]]
-  -gsf : generate a default secrets files settings and exit, parameter is path to secrets files settings [[optional]]
+./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -profile {comma-separated profile names} -profile-directory {path to profile directory} :
+  -n                  : name of the sandbox [[mandatory]]
+  -p                  : absolute path of the project's files [[mandatory]]
+  -e                  : path to environment file [[optional]]
+  -s                  : check secrets [[optional, true by default]]
+  -sf                 : path to secrets files settings [[optional, uses default settings if missing]]
+  -gsf                : generate a default secrets files settings and exit, parameter is path to secrets files settings [[optional]]
+  -profile            : comma-separated list of policy profiles to apply (e.g. python,java) [[optional]]
+  -profile-directory  : directory containing profile YAML files [[optional, default: ./profiles]]
 ```
 
 In the end, project's files should be available within `~/workspace` in the sandbox.
@@ -82,6 +84,21 @@ Project's files are in user's projects/test01 and AI backend is an Ollama server
 Generate a default secrets files settings json :
 ```
 ./docker-sbx-create-sandbox.sh -gsf secrets.json
+```
+
+Use a Python profile to allow access to PyPI:
+```
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -profile python
+```
+
+Use multiple profiles (order matters):
+```
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -profile python,node
+```
+
+Use a custom profile directory:
+```
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -profile myprofile -profile-directory $HOME/my-profiles
 ```
 
 .anthropic.api.env :

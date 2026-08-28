@@ -1,0 +1,12 @@
+name: go
+description: Go module resolution, including VCS hosts commonly used for Go packages
+policies:
+  network:
+    allow:
+      - proxy.golang.org
+      - sum.golang.org
+      - index.golang.org
+      - go.googlesource.com
+      - github.com
+      - gitlab.com
+      - bitbucket.org

@@ -93,7 +93,7 @@ install_docker_sbx() {
   echo "═══════════════════════════════════════════════════════════════"
 
   curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh
-  sudo apt-get install util-linux-extra docker-sbx -y
+  sudo apt-get install util-linux-extra docker-sbx python3-yaml -y
   sudo usermod -aG kvm "${curuser}"
   su - "${curuser}" <<-EOFSBX
     sg kvm -c 'sbx login'

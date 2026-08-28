@@ -1,0 +1,7 @@
+name: flutter
+description: Flutter and Dart package development
+policies:
+  network:
+    allow:
+      - pub.dev
+      - storage.googleapis.com

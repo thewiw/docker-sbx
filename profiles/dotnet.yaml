@@ -1,0 +1,7 @@
+name: dotnet
+description: .NET NuGet package resolution
+policies:
+  network:
+    allow:
+      - nuget.org
+      - api.nuget.org

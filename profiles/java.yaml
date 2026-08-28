@@ -1,0 +1,11 @@
+name: java
+description: Java/Maven/Gradle dependency resolution
+policies:
+  network:
+    allow:
+      - repo.maven.apache.org
+      - repo1.maven.org
+      - plugins.gradle.org
+      - services.gradle.org
+      - repo.gradle.org
+      - jcenter.bintray.com

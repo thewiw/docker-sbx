@@ -1,0 +1,8 @@
+name: python
+description: Python package development (pip, PyPI, test PyPI)
+policies:
+  network:
+    allow:
+      - pypi.org
+      - files.pythonhosted.org
+      - test.pypi.org
