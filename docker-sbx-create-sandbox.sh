@@ -17,6 +17,7 @@ profiles=""
 profile_directory=""
 
 usage() {
+  local exit_code="${1:-1}"
   scriptname=`basename "$0"`
   echo "Usage: $scriptname -n [sandbox name] -p [project path] -e [sandbox env file] -s [check secrets] -sf [secrets config file]"
   echo "Options:"
@@ -43,7 +44,7 @@ usage() {
   echo "  from WSL : $scriptname -n test -p /mnt/c/Projects/test -profile python,java"
   echo "  from WSL : $scriptname -gsf secrets.json"
   echo ""
-  exit 1
+  exit "$exit_code"
 }
 
 ensure_pyyaml() {
@@ -83,8 +84,17 @@ check_project_secrets_files() {
   local avoid_patterns=()
 
   if [[ -n "$secretsfile" && -f "$secretsfile" ]]; then
-    readarray -t search_patterns < <(python3 -c "import json; data=json.load(open('$secretsfile')); [print(p) for p in data.get('search', [])]")
-    readarray -t avoid_patterns < <(python3 -c "import json; data=json.load(open('$secretsfile')); [print(p) for p in data.get('avoid', [])]")
+    # Validate the config up front: a malformed file used to yield zero
+    # patterns, which silently degraded into "not searching for secrets
+    # files". Fail loudly instead. The path is passed as argv so it can not
+    # be interpreted as Python source.
+    if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d, dict); assert all(isinstance(d.get(k, []), list) for k in ('search', 'avoid'))" "$secretsfile" 2>/dev/null; then
+      echo "Error: secrets config file '$secretsfile' must be a JSON object whose 'search' and 'avoid' entries are arrays"
+      echo ""
+      exit 1
+    fi
+    readarray -t search_patterns < <(python3 -c "import json,sys; data=json.load(open(sys.argv[1])); [print(p) for p in data.get('search', [])]" "$secretsfile")
+    readarray -t avoid_patterns < <(python3 -c "import json,sys; data=json.load(open(sys.argv[1])); [print(p) for p in data.get('avoid', [])]" "$secretsfile")
   else
     search_patterns=("google-services.json" "key.properties" "*.jks" "*.cert" "*.crt" "*.key")
     avoid_patterns=(".venv" "node_modules" "bower_components")
@@ -215,8 +225,6 @@ build_volume_args() {
 }
 
 create_sandbox() {
-  prjname=`basename "$path"`
-
   echo ""
   echo "════════════════"
   echo "Creating sandbox $name"
@@ -240,6 +248,14 @@ setup_sandbox() {
 
   sbx cp ./docker-sbx-setup-sandbox.sh "$name":"$sbx_home/setup-sandbox.sh"
   sbx exec -ti "$name" sudo chmod 755 "$sbx_home/setup-sandbox.sh"
+
+  # The Slack hook script is staged only when the feature is switched on, so a
+  # sandbox without it keeps exactly the previous behaviour.
+  if slack_enabled; then
+    sbx cp ./docker-sbx-slack-notify.sh "$name":"$sbx_home/slack-notify.sh"
+    sbx exec -ti "$name" sudo chmod 755 "$sbx_home/slack-notify.sh"
+  fi
+
   if [[ -z "$envfile" ]]; then
     sbx exec -ti "$name" bash "$sbx_home/setup-sandbox.sh" "$path"
   else
@@ -283,6 +299,108 @@ update_sbx_policy() {
     sbx policy allow network --sandbox "$name" "claude.ai"
     sbx policy allow network --sandbox "$name" "platform.claude.com"
   fi
+}
+
+# ----------------------------------------------------------------------
+# Optional Slack notifications (host side) ------------------------------
+# ----------------------------------------------------------------------
+
+env_file_get() {
+  # Read KEY from the -e env file without sourcing it, mirroring the care taken
+  # in update_sbx_policy: strip surrounding whitespace and one pair of quotes.
+  # The trailing "|| true" matters: grep exits 1 when the key is absent, and
+  # with `set -o pipefail` in this script that would make the whole pipeline
+  # fail, so `set -e` would abort creation on any optional variable left unset.
+  local key="$1"
+  if [[ -z "$envfile" || ! -f "$envfile" ]]; then
+    return 0
+  fi
+  grep "^${key}=" "$envfile" 2>/dev/null | tail -1 | cut -d '=' -f 2- \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+          -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" || true
+}
+
+slack_enabled() {
+  [[ "$(env_file_get SBX_SLACK_ENABLED)" == "true" ]]
+}
+
+slack_events() {
+  local events
+  events="$(env_file_get SBX_SLACK_EVENTS)"
+  if [[ -z "$events" ]]; then
+    events="Stop,Notification,SessionStart,SessionEnd"
+  fi
+  printf '%s' "$events"
+}
+
+validate_slack_config() {
+  if ! slack_enabled; then
+    return 0
+  fi
+
+  local webhook token channel
+  webhook="$(env_file_get SBX_SLACK_WEBHOOK_URL)"
+  token="$(env_file_get SBX_SLACK_BOT_TOKEN)"
+  channel="$(env_file_get SBX_SLACK_CHANNEL)"
+
+  if [[ -z "$webhook" && ( -z "$token" || -z "$channel" ) ]]; then
+    echo ""
+    echo "Error: SBX_SLACK_ENABLED is true but no usable Slack target is configured."
+    echo "       Set SBX_SLACK_WEBHOOK_URL, or SBX_SLACK_BOT_TOKEN together with SBX_SLACK_CHANNEL."
+    echo ""
+    exit 1
+  fi
+
+  local event_list event
+  IFS=',' read -ra event_list <<< "$(slack_events)"
+  for event in "${event_list[@]}"; do
+    event="${event// /}"
+    if [[ -z "$event" ]]; then
+      continue
+    fi
+    case "$event" in
+      Stop|Notification|SessionStart|SessionEnd|SubagentStop|UserPromptSubmit)
+        ;;
+      *)
+        echo ""
+        echo "Error: unsupported SBX_SLACK_EVENTS entry '$event'"
+        echo "       Supported events: Stop, Notification, SessionStart, SessionEnd, SubagentStop, UserPromptSubmit"
+        echo ""
+        exit 1
+        ;;
+    esac
+  done
+}
+
+update_sbx_policy_slack() {
+  if ! slack_enabled; then
+    return 0
+  fi
+
+  local webhook token host hosts=()
+  webhook="$(env_file_get SBX_SLACK_WEBHOOK_URL)"
+  token="$(env_file_get SBX_SLACK_BOT_TOKEN)"
+
+  # Allow only what the configured credential style actually needs. Without this
+  # the sandbox's deny-by-default policy would silently drop every notification.
+  if [[ -n "$webhook" ]]; then
+    host="$(printf '%s' "$webhook" | sed -E 's|https?://||; s|[:/].*||')"
+    hosts+=("${host:-hooks.slack.com}")
+  fi
+  if [[ -n "$token" ]]; then
+    hosts+=("slack.com")
+  fi
+
+  if [[ ${#hosts[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo ""
+  echo "Allowing Slack endpoints in sandbox $name network policy"
+  for host in "${hosts[@]}"; do
+    echo "  allowing $host"
+    sbx policy allow network --sandbox "$name" "$host"
+  done
 }
 
 trim() {
@@ -474,7 +592,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -h|--help)
-            usage
+            usage 0
             ;;
         *)
             echo "Unknown option: $1"
@@ -507,6 +625,16 @@ if [[ -z "$name" || -z "$path" ]]; then
   usage
 fi
 
+if [[ "$path" != /* ]]; then
+  echo "Error: project path '$path' must be an absolute path"
+  exit 1
+fi
+
+if [[ ! -d "$path" ]]; then
+  echo "Error: project path '$path' does not exist or is not a directory"
+  exit 1
+fi
+
 if [[ -n "$profile_directory" && ! -d "$profile_directory" ]]; then
   echo "Error: profile directory '$profile_directory' does not exist"
   exit 1
@@ -516,9 +644,12 @@ if [[ -n "$profiles" ]]; then
   ensure_pyyaml
 fi
 
+validate_slack_config
+
 build_volume_args
 check_project_secrets
 create_sandbox
 setup_sandbox
 update_sbx_policy
+update_sbx_policy_slack
 apply_profiles

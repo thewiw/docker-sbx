@@ -1,0 +1,3 @@
+# Gitleaks reports are written next to the scripts by check_project_secrets_git
+# (docker-sbx-create-sandbox.sh reports into $(pwd)), one per scanned project.
+*_gitleaks.json

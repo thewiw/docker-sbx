@@ -124,6 +124,169 @@ ANTHROPIC_AUTH_TOKEN=ollama
 ```
 
 
+## Slack notifications (optional)
+
+A sandbox can tell you what its Claude Code is doing without you having to attach to it.
+When the env file passed with `-e` enables it, the sandbox gets Claude Code hooks that
+post one short line per lifecycle event:
+
+```
+[test01] test01 — Claude Code is done
+```
+
+It is off unless asked for: with no `SBX_SLACK_*` variables in the env file, nothing is
+written and the sandbox behaves exactly as before.
+
+### Before you start: a Slack app and a dedicated channel
+
+Nothing here posts to Slack as *you*. Both credential styles post as an **app**, so two
+things must exist before any of it can work:
+
+1. **A Slack app, declared in your workspace.** Create one at
+   [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From
+   scratch**, and pick the workspace you want the notifications in. `docker-sbx` never
+   registers anything for you — it only uses the credential you put in the env file, and
+   Slack is the side that authorises it.
+2. **A destination the app is allowed to post to** — a dedicated channel that you either
+   select when creating the webhook, or invite the app into (bot-token mode). An app
+   belongs to no channel by default, not even a private channel you created yourself, and
+   `chat.postMessage` refuses with `not_in_channel` until it has been invited; inviting
+   the app in both modes keeps that unambiguous. Your own DM with yourself is not a
+   usable destination either way; see [Getting the channel id](#getting-the-channel-id).
+
+So create a channel dedicated to this — `#docker-sbx`, say — invite the app to it with
+`/invite @your-app`, and pick that same channel when you create the webhook. Keeping it
+separate matters for two reasons: the notifications do not land in a conversation you read
+as yourself, and the credential you place inside the sandbox is scoped to a channel you are
+willing to let an agent post into.
+
+### Getting a credential
+
+Both styles start from that same app, and both are created in Slack:
+
+**Webhook — least privilege.** In the app: **Incoming Webhooks** → switch it on → **Add
+New Webhook to Workspace** → choose the channel you just created. Slack shows a URL bound
+to that channel. That URL *is* the credential, so it can only ever post to that one
+channel.
+
+**Bot token.** In the app: **OAuth & Permissions** → add the **`chat:write`** scope (add
+**`im:write`** as well only if you also want the app to be able to DM you) → **Install to
+Workspace** → copy the **Bot User OAuth Token** (`xoxb-…`). Then look up the destination
+channel's id — [Getting the channel id](#getting-the-channel-id) — and confirm the app has
+been invited to it.
+
+### Setup
+
+Write an env file (for example `$HOME/private/.slack.env`) with **one** of the two
+credentials:
+
+```
+SBX_SLACK_ENABLED=true
+SBX_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T00000000/B00000000/xxxxxxxx
+```
+
+```
+SBX_SLACK_ENABLED=true
+SBX_SLACK_BOT_TOKEN=xoxb-…
+SBX_SLACK_CHANNEL=C0123456789
+```
+
+and pass it like any other env file:
+
+```
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.slack.env
+```
+
+### Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SBX_SLACK_ENABLED` | `false` | Master switch. Anything other than `true` leaves the sandbox untouched. |
+| `SBX_SLACK_WEBHOOK_URL` | – | Incoming webhook URL. Bound to a single channel by Slack. |
+| `SBX_SLACK_BOT_TOKEN` | – | Bot token (`xoxb-…`, needs the `chat:write` scope). Requires `SBX_SLACK_CHANNEL`. |
+| `SBX_SLACK_CHANNEL` | – | Default channel **id** for the bot-token mode — not a name. See [Getting the channel id](#getting-the-channel-id). |
+| `SBX_SLACK_EVENTS` | `Stop,Notification,SessionStart,SessionEnd` | Which events to notify on. `SubagentStop` and `UserPromptSubmit` are also accepted. |
+| `SBX_SLACK_PREFIX` | – | Extra text prepended to every message. |
+| `SBX_SLACK_DRYRUN` | `false` | Print the resolved message instead of posting it. |
+
+If both credential styles are configured, the bot token wins. Any webhook or channel
+variable can be redirected for a single event by appending the upper-cased event name —
+`SBX_SLACK_WEBHOOK_NOTIFICATION=…`, for instance, sends `Notification` messages somewhere
+other than everything else.
+
+Messages are deliberately short: sandbox name, project name, and a fixed phrase per event
+(`Claude Code is done`, `Claude Code waits for your input`, `Claude Code session started`…).
+For `Notification` events, Claude Code's own reason for interrupting is appended on a
+second line.
+
+### Getting the channel id
+
+Bot-token mode needs a channel **id**, not a channel name. A name is accepted unreliably at
+best, so `#my-channel` or `my-channel` commonly fails with `channel_not_found`; an id always
+works, and keeps working when the channel is renamed.
+
+To find it, open the channel in Slack, click its name, and choose **View channel
+details**: the id is at the bottom of the panel. Alternatively **Copy link** and take the
+trailing segment of the URL — in `…/archives/C0123456789`, the id is `C0123456789`.
+
+```
+C0123456789   public channel
+G0123456789   private channel
+D0123456789   direct message the app is a participant in
+```
+
+**A personal DM cannot be used.** The conversation in your sidebar under your own name —
+the one where you message yourself — carries a `D…` id as well, but it is a dialogue
+between you and yourself, so no app can be a participant in it and the bot token cannot
+see it at all. Pointing `SBX_SLACK_CHANNEL` at it fails with `channel_not_found` even
+though the id is exactly right. A `D…` id works only when it is a DM the app itself is
+part of, which is what `conversations.open` returns for a user id (needs `im:write`); for
+notifications, a public or private channel the app has been invited to is the simpler
+target.
+
+The bot must also be a member of that channel, or `chat.postMessage` still fails — with
+`not_in_channel` this time, even when the id is correct. Invite it from inside the
+channel with `/invite @your-app`.
+
+Both failures, and the channel value that was actually sent, are recorded in
+`~/.claude/hooks/slack-errors.log` inside the sandbox — check it there rather than
+guessing, since `channel_not_found` and `not_in_channel` are indistinguishable from
+Slack's reply alone.
+
+If you would rather read the ids from Slack than from the UI, `conversations.list` works
+from inside the sandbox (`slack.com` is already allowed), but it needs `channels:read` /
+`groups:read` in addition to `chat:write`:
+
+```bash
+set -a; . ~/.claude/hooks/slack.env; set +a
+curl -s -H "Authorization: Bearer $SBX_SLACK_BOT_TOKEN" \
+  'https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=200' \
+  | jq -r '.channels[] | "\(.id)\t\(.name)"'
+```
+
+### How it is wired, and what it costs you
+
+- A hook script is installed at `~/.claude/hooks/slack-notify.sh` inside the sandbox, and
+  `hooks` entries for the chosen events are merged into `~/.claude/settings.json`. Existing
+  hooks are preserved, and re-running setup replaces rather than duplicates its own entries.
+- The credential lives in `~/.claude/hooks/slack.env`, mode `600`, outside the project
+  volume. It is still readable by the agent running in that sandbox — so scope the
+  credential accordingly. An incoming webhook bound to one channel is the least-privilege
+  option; a bot token can post to every channel the bot belongs to.
+- Network policy is extended **per sandbox** with only the endpoint that credential style
+  needs: `hooks.slack.com` for webhooks, `slack.com` for a bot token. Nothing global changes.
+- Every hook exits `0` and never writes to stdout, so a Slack outage cannot block or
+  derail the agent. A failed post therefore cannot interrupt you, but it is **not** silent:
+  the reason is appended to `~/.claude/hooks/slack-errors.log` (mode `600`, one line per
+  failure, created only when something fails). Check it first if a message never arrives —
+  it distinguishes a webhook Slack rejected, a bot that was not invited to the channel
+  (`not_in_channel`), a bad token (`invalid_auth`), and a request the sandbox's network
+  policy dropped (HTTP `403`). The webhook path is redacted, since it is the credential.
+  `SBX_SLACK_DRYRUN=true` still resolves and prints the message without posting.
+- The env file is read as-is, so a CRLF file is fine: the sandbox strips the carriage
+  return, exactly as the host side already did.
+
+
 ## Use a sandbox
 
 Standard launch command is `sbx run [sandbox name]`, Claude should execute automatically within project's directory.

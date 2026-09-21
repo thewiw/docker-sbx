@@ -16,7 +16,8 @@ All scripts must remain in the same directory and are run from that directory.
 |--------|---------|
 | `docker-sbx-install.sh` | One-time host setup. Installs Docker CE and the `docker-sbx` engine, creates a `kvm` group user, and sets default network policies (deny-all, allow only Ubuntu archives and Docker download). Must be run with `sudo`. |
 | `docker-sbx-create-sandbox.sh` | Creates a new sandbox for a project. Scans the project for secrets (file patterns + gitleaks), runs `sbx create`, then copies `docker-sbx-setup-sandbox.sh` into the sandbox and executes it. Optionally applies per-sandbox policy profiles. |
-| `docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox. Stops any running `apt` processes, updates packages, installs `jq`, writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`, and symlinks `~/workspace` to the project path on the host. |
+| `docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox. Stops any running `apt` processes, updates packages, installs `jq`, writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`, and symlinks `~/workspace` to the project path on the host. Also installs the optional Slack notification hook when the env file asks for it. |
+| `docker-sbx-slack-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/slack-notify.sh`. Invoked by Claude Code as a hook with the event payload on stdin; posts one short line per lifecycle event to Slack. Only installed when the optional feature is enabled via the env file. |
 | `profiles/` | YAML policy profiles used by `docker-sbx-create-sandbox.sh` to grant a sandbox access to language-specific external resources. |
 
 ## Security Model
@@ -24,6 +25,7 @@ All scripts must remain in the same directory and are run from that directory.
 - **Default network policy**: deny-all. Only `archive.ubuntu.com`, `security.ubuntu.com`, and `download.docker.com` are allowed globally. Explicit deny rules are also set for GitHub, GitLab, Bitbucket, and Postman domains.
 - **Secret scanning**: before a sandbox is created, the script checks for credential files (`google-services.json`, `key.properties`, `*.jks`, `*.cert`, `*.crt`, `*.key`) and runs `gitleaks` against the project's git repository. Creation aborts if secrets are found.
 - **Shared volume**: the project directory is mounted as a shared volume. Claude Code has write access to the entire sandbox filesystem, including this volume. Do not place credentials inside the project path or in git history.
+- **Slack notifications** (optional): when enabled, the sandbox's own network policy is extended with just the endpoint the configured credential style needs (`hooks.slack.com` for a webhook, `slack.com` for a bot token) — no global rule is added. The credential is written to `~/.claude/hooks/slack.env`, mode `600`, outside the project volume. It is still readable by the agent in that sandbox, so scope the credential to what you are willing to expose there: an incoming webhook bound to a single channel is least privilege, a bot token (`chat:write`) can post anywhere the bot is a member. `docker-sbx-create-sandbox.sh` aborts if `SBX_SLACK_ENABLED=true` but no usable target is configured, rather than silently installing a hook that can never deliver.
 
 ## Creating a Sandbox
 
@@ -111,6 +113,45 @@ ANTHROPIC_AUTH_TOKEN=ollama
 ```
 
 When `ANTHROPIC_BASE_URL` is set, the setup script disables the attribution header and sets `ANTHROPIC_AUTH_TOKEN`.
+
+## Slack Notifications (optional)
+
+Off by default, enabled purely through `-e`; there are no CLI flags. With no `SBX_SLACK_*`
+variables present the sandbox is configured exactly as it was before.
+
+```
+SBX_SLACK_ENABLED=true
+SBX_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T…/B…/xxx   # mode A: webhook
+SBX_SLACK_BOT_TOKEN=xoxb-…                                         # mode B: bot token
+SBX_SLACK_CHANNEL=C0123456789                                      # mode B: channel id
+SBX_SLACK_EVENTS=Stop,Notification,SessionStart,SessionEnd         # default set
+SBX_SLACK_PREFIX=[docker-sbx]                                      # optional, prepended
+SBX_SLACK_DRYRUN=true                                              # optional, print instead of post
+```
+
+- Both styles post as a **Slack app**, never as the user: the app must be declared in the workspace and given a destination it may post to (the channel selected when creating the webhook, or one the app was invited into — an app belongs to no channel by default). The scripts only consume the credential; they provision nothing in Slack, so `channel_not_found` and `not_in_channel` are the expected failures when the destination side is not set up. A member's own DM with themselves is a valid-looking `D…` id that no app can post into — `README.md` documents both.
+- Bot token wins when both styles are configured.
+- Per-event target override: append the upper-cased event name, e.g. `SBX_SLACK_WEBHOOK_NOTIFICATION` or `SBX_SLACK_CHANNEL_NOTIFICATION`.
+- Accepted events: `Stop`, `Notification`, `SessionStart`, `SessionEnd`, `SubagentStop`, `UserPromptSubmit`. An unknown name aborts creation.
+- Message format: `[<sandbox>] <project> — <phrase>`, plus Claude Code's own reason on a second line for `Notification` events.
+
+What gets installed inside the sandbox:
+
+- `~/.claude/hooks/slack-notify.sh` (755) — the hook itself; always exits 0 and never writes to stdout.
+- `~/.claude/hooks/slack.env` (600) — credentials plus the sandbox and project labels.
+- `~/.claude/hooks/slack-errors.log` (600) — one line per failed post, created on the first failure. Not created when everything succeeds.
+- `hooks` entries in `~/.claude/settings.json` for the chosen events, merged idempotently: docker-sbx's own entries are replaced and any other hooks are preserved. `matcher` is deliberately omitted — these are lifecycle events, not tool events.
+
+Things to keep in mind when editing this feature:
+
+- The hook sits on the critical path of every enabled event: always exit 0, print nothing, and cap network calls with `curl --max-time`.
+- Failures are recorded, not swallowed. A post that never lands is silent on the agent's side, so before `slack-errors.log` existed a revoked webhook, a bot that was never invited and a request blocked by the network policy all looked identical to success. Keep the distinction: Slack reports API errors (`not_in_channel`, `invalid_auth`, `missing_scope`) as **HTTP 200 with `ok:false`**, so the response body — not the status code — is what decides success in bot-token mode. The log is truncated past 64 KB and never contains a webhook path (`log_safe_url` strips it, since the path is the credential). Bot-token failures also name the channel that was tried: `channel_not_found` and `not_in_channel` are only distinguishable by seeing what was actually sent — a channel id, a `#name`, or a value that still carried CRLF are indistinguishable from Slack's reply alone.
+- The POST must declare `Content-type: application/json`. curl's default for `--data-binary` is `application/x-www-form-urlencoded`, and Slack — told to expect form data but handed JSON — answers HTTP 200 `{"ok":false,"error":"invalid_form_data"}` rather than a 4xx. The header is therefore set once inside `post_request`, not at each call site, and `run-tests.sh` asserts it on the wire: a sink that merely reads the body cannot tell a good request from this broken one, which is how the header was once lost in a refactor without any test noticing.
+- The two halves must agree on how the env file is parsed. `env_file_get` (host) trims surrounding whitespace; `load_env_file` (sandbox) must strip at least a trailing CR, because a CRLF env file — the default from a Windows editor on WSL — otherwise yields `true\r`, which is not `true`. When they disagree the host reports the feature as enabled while the sandbox installs nothing, so `install_slack_hook` also warns loudly rather than no-op'ing when `SBX_SLACK_ENABLED` is set to anything unrecognised. Both guards are covered by `run-tests.sh`.
+- `slack.env` is **sourced** by the hook, so values are written as single-quoted shell literals — a project path containing quotes, `<`, `&` or `$(…)` has to stay inert.
+- Escape `&`, `<`, `>` before posting: Slack treats a bare `<` as the start of a link/mention entity. Use `sed` rather than `${var//pat/repl}` — from bash 5.2 (Ubuntu 24.04+) `patsub_replacement` is on by default, so `&` in the replacement means "the matched text" and turns `&lt;` into `<lt;`.
+- `env_file_get` in `docker-sbx-create-sandbox.sh` ends with `|| true` on purpose: that script runs with `set -o pipefail`, so an absent key would otherwise abort creation through `set -e`.
+- The mechanism is verified, not assumed: a settings-level `hooks` block does fire, `matcher` is optional for lifecycle events, and the payload arrives on stdin. `run-tests.sh` covers the env contract (including a CRLF env file), the merge, failure logging, and a real POST to a loopback endpoint.
 
 ## Using a Sandbox
 
