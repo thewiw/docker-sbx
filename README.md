@@ -32,7 +32,7 @@ This must be done each time a new sandbox must be created.
 Each sandbox is based on 3 main components :
   - Claude Code as AI Agent
   - a shared volume where the project is
-  - a network security policy (shared between all sandboxes, only HTTP, HTTPS and SSH protocols are allowed)
+  - a network security policy (a restrictive default shared by all sandboxes — only HTTP, HTTPS and SSH protocols are allowed — which per-sandbox profiles can extend)
 
 Claude Code has got write access to the whole sandbox filesystem, including the shared volume, so DO NOT STORE CREDENTIALS in this project volume
 
@@ -41,16 +41,19 @@ For maximum security, the shared volume should only contain project files (sourc
 For the same reason, sources history (git) MUST NOT contain credentials/certificates/... either (or worst-case scenario if those data exist then they must be obsolete).
 
 ```
-./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -profile {comma-separated profile names} -profile-directory {path to profile directory} :
+./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -v {path} -profile {comma-separated profile names} -profile-directory {path to profile directory} :
   -n                  : name of the sandbox [[mandatory]]
   -p                  : absolute path of the project's files [[mandatory]]
   -e                  : path to environment file [[optional]]
   -s                  : check secrets [[optional, true by default]]
   -sf                 : path to secrets files settings [[optional, uses default settings if missing]]
   -gsf                : generate a default secrets files settings and exit, parameter is path to secrets files settings [[optional]]
+  -v                  : extra host directory/file to mount into the sandbox (absolute path) [[optional, repeatable]]
   -profile            : comma-separated list of policy profiles to apply (e.g. python,java) [[optional]]
   -profile-directory  : directory containing profile YAML files [[optional, default: ./profiles]]
 ```
+
+Extra volumes passed with `-v` are mounted **read-only by default**; append `:rw` to mount read-write (or `:ro` to be explicit). Each path is mounted inside the sandbox at the same absolute path it has on the host. Repeat `-v` for several mounts.
 
 In the end, project's files should be available within `~/workspace` in the sandbox.
 
@@ -101,6 +104,11 @@ Use a custom profile directory:
 ./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -profile myprofile -profile-directory $HOME/my-profiles
 ```
 
+Mount an extra directory read-only and another one read-write:
+```
+./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -v /mnt/c/docs -v /mnt/c/data:rw
+```
+
 .anthropic.api.env :
 ```
 ANTHROPIC_API_KEY=[your anthropic API key]
@@ -121,6 +129,60 @@ Example for locally dockerized ollama server with port 11434:
 ```
 ANTHROPIC_BASE_URL=http://host.docker.internal:11434
 ANTHROPIC_AUTH_TOKEN=ollama
+```
+
+
+## Policy Profiles
+
+By default every sandbox shares the same restrictive network policy. A **profile** adds
+extra **per-sandbox** network rules, so a project that needs PyPI or npm can reach it
+without opening that domain up for every sandbox.
+
+Profiles are YAML files in the `./profiles` directory (or the directory given with
+`-profile-directory`) and are selected with `-profile`. They are applied after all
+standard rules, so profile rules take precedence.
+
+### Profile format
+
+```yaml
+name: python
+description: Python package development
+policies:
+  network:
+    allow:
+      - pypi.org
+      - files.pythonhosted.org
+      - test.pypi.org
+    deny:
+      - bad.example.com
+```
+
+Rules:
+
+- Top-level keys allowed: `name`, `description`, `policies`.
+- `policies.network` may contain `allow` and `deny`, each a list of non-empty domain strings.
+- Any key that would imply a global policy is rejected; profiles are always per-sandbox.
+- Malformed or unknown profiles abort sandbox creation.
+
+### Standard profiles
+
+| Profile | Grants access to |
+|---|---|
+| `python` | PyPI and test PyPI |
+| `java` | Maven Central and Gradle repositories |
+| `java-spring-boot` | Java domains plus Spring repositories and `start.spring.io` |
+| `go` | Go module proxy and common VCS hosts (GitHub, GitLab, Bitbucket) |
+| `node` | npm and Yarn registries |
+| `rust` | crates.io |
+| `dotnet` | NuGet.org |
+| `flutter` | pub.dev and Google Storage for Flutter SDK / Dart packages |
+
+Example:
+
+```bash
+./docker-sbx-create-sandbox.sh -n pyproject -p "$HOME/projects/pyproject" -profile python
+./docker-sbx-create-sandbox.sh -n spring -p "$HOME/projects/spring" -profile java-spring-boot
+./docker-sbx-create-sandbox.sh -n fullstack -p "$HOME/projects/fullstack" -profile python,node
 ```
 
 
@@ -292,3 +354,44 @@ curl -s -H "Authorization: Bearer $SBX_SLACK_BOT_TOKEN" \
 Standard launch command is `sbx run [sandbox name]`, Claude should execute automatically within project's directory.
 
 Run `sbx exec -ti [sandbox name] bash` if you need to take a look or fix something from within the sandbox.
+
+
+## Update sandboxes
+
+`docker-sbx-update-sandboxes.sh` refreshes the OS packages inside existing sandboxes:
+for each one it runs `sudo apt update`, then `sudo apt upgrade -y`, then
+`sudo apt autoremove -y`. With no arguments it processes every sandbox returned by
+`sbx ls`.
+
+```
+./docker-sbx-update-sandboxes.sh                       # every sandbox
+./docker-sbx-update-sandboxes.sh -i bc,web-1           # only bc and web-1
+./docker-sbx-update-sandboxes.sh -x bc,web-1           # all except bc and web-1
+./docker-sbx-update-sandboxes.sh -i bc,web-1 -x bc     # bc is skipped (exclusions win)
+```
+
+`-i`/`--include` and `-x`/`--exclude` take a comma- or space-separated list and are
+repeatable. When you pass `-i`, the sandbox list is never fetched — useful when listing
+is slow or unreliable.
+
+The recommended invocation wraps it in `script`, because `sbx` wants a real TTY:
+
+```
+script -q /dev/null ./docker-sbx-update-sandboxes.sh [OPTIONS]
+```
+
+Useful environment variables (all optional):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DRY_RUN=1` | `0` | Print the command that would run for each sandbox; change nothing. |
+| `CLOUD=1` | `0` | Target cloud sandboxes (adds the global `--cloud` option). |
+| `SBX_TIMEOUT` | `120` | Seconds allowed per query call (`sbx ls`, `version`, `daemon status`). |
+| `SBX_EXEC_FLAGS` | auto | Force the `sbx exec` flags instead of auto-detecting (`-ti` on a TTY, else `-i`). |
+| `SBX_LS_CMD` | – | Custom listing command; sandbox names on stdout. |
+| `APT_CHAIN` | – | Override the in-sandbox command chain. |
+| `APT` | `apt-get` | Package manager (`apt-get` or `apt`). |
+| `SUDO` | `sudo` | Command prefix; use `sudo -n` to never prompt and fail fast instead. |
+
+Each sandbox is handled in turn and the run finishes with a summary
+(`ok=… failed=… skipped=…`). The script exits non-zero if any sandbox failed.
