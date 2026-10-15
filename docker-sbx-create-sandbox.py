@@ -32,6 +32,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -39,6 +40,15 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 SBX_HOME = "/home/agent"
+
+# How long a brand-new sandbox's first start may take before setup gives up on it,
+# how often to re-check, and how often to say so. The first start is when the guest
+# gets its agent (sbx downloads it there) and when the sandbox's own startup hooks
+# run apt, so the wait is normally dominated by that download - hence the generous
+# timeout.
+SANDBOX_READY_TIMEOUT = 600
+SANDBOX_READY_POLL = 5
+SANDBOX_READY_REPORT = 30
 
 DEFAULT_SEARCH_PATTERNS = (
     "google-services.json",
@@ -85,11 +95,22 @@ def info(msg: str = "") -> None:
     print(msg)
 
 
+def _flush_stdout() -> None:
+    """Keep stderr in step with stdout.
+
+    stdout is block-buffered when the output is piped, while stderr is not, so a
+    warning or error would otherwise surface *before* the lines explaining it.
+    """
+    sys.stdout.flush()
+
+
 def warn(msg: str) -> None:
+    _flush_stdout()
     print(f"Warning: {msg}", file=sys.stderr)
 
 
 def die(msg: str) -> "None":
+    _flush_stdout()
     print(f"Error: {msg}", file=sys.stderr)
     print()
     sys.exit(1)
@@ -108,13 +129,27 @@ class _DryResult:
     stderr = ""
 
 
-def run(cmd, *, check: bool = True, capture: bool = False):
-    """Run a command, echoing it first. Aborts on failure when check is set."""
+def run(cmd, *, check: bool = True, capture: bool = False, quiet: bool = False):
+    """Run a command, echoing it first. Aborts on failure when check is set.
+
+    quiet suppresses the echo for the commands that are polled (the readiness
+    probe), where one line per attempt would bury the rest of the output.
+    """
     cmd = [str(c) for c in cmd]
-    info("  $ " + " ".join(shlex.quote(c) for c in cmd))
+    if not quiet:
+        info("  $ " + " ".join(shlex.quote(c) for c in cmd))
     if DRY_RUN:
         return _DryResult()
-    proc = subprocess.run(cmd, text=True, capture_output=capture)
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=capture)
+    except FileNotFoundError:
+        # subprocess raises rather than reporting a status when the binary is not on
+        # PATH, which surfaced as a bare traceback the moment `sbx` was missing.
+        if check:
+            die(f"command not found: {cmd[0]} (is it installed and on PATH?)")
+        # check=False callers handle return codes, so answer in the same currency -
+        # 127 is what a shell reports for a command it cannot find.
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: command not found")
     if check and proc.returncode != 0:
         die(f"command failed with exit code {proc.returncode}: " + " ".join(cmd))
     return proc
@@ -335,6 +370,35 @@ def find_git_dir(root: str) -> str:
     return ""
 
 
+def docker_daemon_running() -> bool:
+    """Is the Docker daemon actually reachable?
+
+    Having the `docker` CLI on PATH says nothing about the daemon. With Docker
+    Desktop installed but not started, every `docker run` dies with
+    "open //./pipe/docker_engine: The system cannot find the file specified" - and
+    that used to be misreported as a gitleaks finding.
+    """
+    return run(["docker", "info"], check=False, capture=True).returncode == 0
+
+
+def docker_daemon_start_lines():
+    """How to start the Docker daemon on this host, ready to print as-is."""
+    if os.name == "nt":
+        return [
+            "Start Docker Desktop from the Start menu, or from PowerShell:",
+            '    Start-Process "$env:ProgramFiles\\Docker\\Docker\\Docker Desktop.exe"',
+        ]
+    if sys.platform == "darwin":
+        return [
+            "Start Docker Desktop, or from a terminal:",
+            "    open -a Docker",
+        ]
+    return [
+        "Start the docker service:",
+        "    sudo systemctl start docker     # or: sudo service docker start",
+    ]
+
+
 def check_project_secrets_git() -> None:
     gitrepo = find_git_dir(path())
 
@@ -355,8 +419,27 @@ def check_project_secrets_git() -> None:
             "the scan"
         )
 
+    # Same reasoning one level down: the CLI being present does not mean the daemon
+    # is up, and a stopped Docker Desktop would otherwise be reported as a leak.
+    if not DRY_RUN and not docker_daemon_running():
+        die(
+            "\n       ".join(
+                [
+                    "Docker is installed but its daemon is not reachable, so the secret",
+                    "scan cannot run. Start it, wait for it to finish starting, then run",
+                    "this command again:",
+                    *docker_daemon_start_lines(),
+                    "Or re-run with '-s false' to skip the scan.",
+                ]
+            )
+        )
+
     report_name = f"{name()}_gitleaks.json"
-    if not run(
+    # gitleaks exits 0 when the repository is clean and non-zero when it finds
+    # something, so a non-zero here is the finding. (The bash original is
+    # `if ! docker run ...`; the port had drifted to `if not <rc>`, which is the
+    # opposite - it aborted on a clean repo and passed a leaking one.)
+    if run(
         [
             "docker",
             "run",
@@ -435,15 +518,112 @@ def build_volume_args():
 # --------------------------------------------------------------------------
 
 
+def parse_table_names(text: str):
+    """First column of the human-readable `sbx ls` table, minus the header.
+
+    Deliberately the same rule as docker-sbx-update-sandboxes.py, so the two
+    scripts agree on what a sandbox name looks like.
+    """
+    headers = {"NAME", "ID", "SANDBOX", "AGENT"}
+    names = []
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        first = fields[0]
+        if first in headers or re.fullmatch(r"[-─=]+", first):
+            continue
+        names.append(first)
+    return sorted(set(names))
+
+
+def existing_sandbox_names():
+    """Sandbox names, from `sbx ls -q`, falling back to the first table column."""
+    proc = run(["sbx", "ls", "-q"], check=False, capture=True)
+    if proc.returncode == 0:
+        names = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if names:
+            return names
+    return parse_table_names(run(["sbx", "ls"], check=False, capture=True).stdout)
+
+
+def sandbox_ready() -> bool:
+    """Has the sandbox finished its first start - runtime up, agent installed?
+
+    `sbx exec` cannot succeed before the runtime is up, and the agent binary only
+    exists once that first start has provisioned it, so testing for the binary is
+    what actually tells us the boot is over. A non-login exec does not inherit
+    `~/.local/bin` on PATH (the template's own startup hook exports it by hand), so
+    the file is tested directly rather than with `command -v`.
+    """
+    probe = 'test -x "$HOME/.local/bin/claude" || test -x "$HOME/.claude/local/claude"'
+    return (
+        run(["sbx", "exec", "-i", name(), "sh", "-c", probe], check=False, quiet=True).returncode
+        == 0
+    )
+
+
+def wait_for_sandbox() -> bool:
+    """Wait for the new sandbox's first start to settle. False on timeout.
+
+    The first start is when the guest gets its agent and when the sandbox's own
+    startup hooks run apt; configuring a sandbox in the middle of that is what used
+    to leave sandboxes that could not be started again.
+    """
+    if DRY_RUN:
+        return True
+
+    info(f"Waiting for sandbox {name()} to finish starting (up to {SANDBOX_READY_TIMEOUT}s)...")
+    started = time.monotonic()
+    reported = 0
+    while True:
+        if sandbox_ready():
+            info(f"  sandbox {name()} is up")
+            return True
+        elapsed = int(time.monotonic() - started)
+        if elapsed >= SANDBOX_READY_TIMEOUT:
+            return False
+        if elapsed // SANDBOX_READY_REPORT > reported:
+            reported = elapsed // SANDBOX_READY_REPORT
+            info(f"  still starting... ({elapsed}s)")
+        time.sleep(SANDBOX_READY_POLL)
+
+
 def create_sandbox(volume_args) -> None:
     banner(f"Creating sandbox {name()}")
     info()
-    sbx(["create", "--name", name(), "claude", path(), *volume_args])
+
+    # Never reconfigure a sandbox we did not just create. `sbx create` fails on an
+    # existing name, and that failure used to scroll past (sbx() runs with
+    # check=False), so the setup then ran against the *previous* sandbox of that
+    # name and the run still reported success.
+    if not DRY_RUN and name() in existing_sandbox_names():
+        die(
+            f"sandbox '{name()}' already exists - remove it with `sbx rm {name()}`, "
+            "or choose another name with -n"
+        )
+
+    # Fatal: every later step (cp, exec, policy) assumes this sandbox exists, and is
+    # the one we just made.
+    sbx(["create", "--name", name(), "claude", path(), *volume_args], check=True)
 
 
 def setup_sandbox() -> None:
     banner(f"Updating sandbox {name()}")
     info()
+
+    # Configuring the sandbox means running commands inside it, and that is also
+    # what starts it - so wait for the first start to finish before touching it.
+    # `sbx start` is not fatal: if the runtime refuses to come up, its own message
+    # is more useful than ours, and the readiness probe below is what decides.
+    sbx(["start", name()])
+    if not wait_for_sandbox():
+        die(
+            f"sandbox '{name()}' did not start within {SANDBOX_READY_TIMEOUT}s, so it was "
+            "left unconfigured.\n"
+            f"       Find out why it will not start (sbx diagnose, then `sbx start {name()}`), "
+            f"and re-run this command once `sbx run {name()}` works."
+        )
 
     setup_script = script_dir() / "sandbox" / "docker-sbx-setup-sandbox.sh"
     slack_script = script_dir() / "sandbox" / "docker-sbx-slack-notify.sh"
@@ -457,15 +637,23 @@ def setup_sandbox() -> None:
         sbx(["cp", str(slack_script), f"{name()}:{SBX_HOME}/slack-notify.sh"])
         sbx(["exec", "-ti", name(), "sudo", "chmod", "755", f"{SBX_HOME}/slack-notify.sh"])
 
+    # The in-sandbox script takes the project path and the env-file path, with "-"
+    # standing in for "no env file": an empty argument does not survive the trip
+    # through `sbx exec`.
     if not envfile():
-        sbx(["exec", "-ti", name(), "bash", f"{SBX_HOME}/setup-sandbox.sh", path()])
+        sbx(["exec", "-ti", name(), "bash", f"{SBX_HOME}/setup-sandbox.sh", path(), "-"])
         return
 
     info(f"Using env file {envfile()}")
     envbasename = os.path.basename(envfile())
     sbx(["cp", envfile(), f"{name()}:{SBX_HOME}/{envbasename}"])
     sbx(["exec", "-ti", name(), "sudo", "chmod", "644", f"{SBX_HOME}/{envbasename}"])
-    sbx(["exec", "-ti", name(), "bash", f"{SBX_HOME}/setup-sandbox.sh", path(), f"{SBX_HOME}/{envbasename}"])
+    sbx(
+        [
+            "exec", "-ti", name(), "bash", f"{SBX_HOME}/setup-sandbox.sh",
+            path(), f"{SBX_HOME}/{envbasename}",
+        ]
+    )
 
 
 # --------------------------------------------------------------------------
@@ -829,6 +1017,10 @@ def secrets() -> str:
     return CONFIG.secrets
 
 
+def secretsfile() -> str:
+    return CONFIG.secretsfile
+
+
 def volumes():
     return CONFIG.volumes
 
@@ -885,7 +1077,20 @@ def main(argv=None) -> int:
     if CONFIG.profile_directory and not os.path.isdir(CONFIG.profile_directory):
         die(f"profile directory '{CONFIG.profile_directory}' does not exist")
 
+    # The arguments the user passed are checked before the environment they are
+    # passed in: the bash implementation has no `sbx` precondition, so validating
+    # Slack after it made the two report different errors on a host without `sbx`.
     validate_slack_config()
+
+    # Fail fast, before the secret scan and before anything is created. Individual
+    # `sbx` calls are deliberately non-fatal (sbx() runs with check=False, as the
+    # bash version did), so without this a missing sbx would sail through every step
+    # doing nothing and still report success.
+    if not DRY_RUN and not have("sbx"):
+        die(
+            "the sbx command was not found on PATH - run docker-sbx-install.py first, "
+            "then open a new terminal so the PATH change is picked up"
+        )
 
     volume_args = build_volume_args()
     check_project_secrets()

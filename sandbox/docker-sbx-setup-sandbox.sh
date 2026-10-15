@@ -1,60 +1,27 @@
 prjpath=$1
 envfilepath=${2:-}
 
-stop_apt() {
-  sleep 5
-
-  curpid=$$
-  # Match only command lines that *start* with a known apt/dpkg executable.
-  # The previous unanchored 'apt(-|/)?' also matched any process whose argv
-  # merely contained the substring "apt" - including an ancestor shell carrying
-  # the project path (e.g. "-p /mnt/c/Projects/aptitude"), so this could SIGKILL
-  # the setup script's own parent chain mid-run.
-  apt_re='^(/(usr/)?(s?bin)/)?(apt|apt-get|apt-key|apt-config|apt-mark|dpkg|dpkg-deb|dpkg-query|dpkg-split)([[:space:]]|$)'
-  apt_re+='|^/(usr/)?bin/python3[0-9.]* /usr/share/unattended-upgrades/'
-
-  mapfile -t aptpids < <(
-      pgrep -f "$apt_re" | grep -v "^$curpid$"
-  )
-
-  if [ ${#aptpids[@]} -eq 0 ]; then
-    echo "✅  No apt‑related processes found – nothing to kill."
-    return 0
-  fi
-
-  SECONDS=0
-
-  printf "🔍  Current process: $curpid\n"
-
-  while [[ ${#aptpids[@]} -gt 0 && SECONDS -lt 60 ]]; do
-    printf "🔍  Apt processes: %s\n" "${aptpids[*]}"
-
-    # ---- Graceful stop -------------------------------------------------
-    if [[ SECONDS -lt 30 ]]; then
-      sudo kill -TERM "${aptpids[@]}" 2>/dev/null || true
-    else
-      sudo kill -KILL "${aptpids[@]}" 2>/dev/null || true
-    fi
-    sleep 2 # give them a chance to clean up
-
-    mapfile -t aptpids < <(
-      pgrep -f "$apt_re" | grep -v "^$curpid$"
-    )
-  done
-
-  if [ ${#aptpids[@]} -gt 0 ]; then
-    printf "⚠️  Some apt processes survived SIGTERM  %s - sending SIGKILL\n" "${aptpids[*]}"
-    sudo kill -KILL "${aptpids[@]}" 2>/dev/null || true
-    sleep 5
-  else
-    printf "✅  All apt processes terminated cleanly\n"
-  fi
-}
+# The Python host passes "-" to mean "no env file", so that an empty argument does
+# not have to survive the trip through `sbx exec`.
+[[ "$envfilepath" == "-" ]] && envfilepath=""
 
 install_tools() {
-  sudo apt update -y
-  sudo apt upgrade -y
-  sudo apt install jq -y
+  # jq is required by the settings merge and the Slack hook further down. The
+  # template ships it, so this normally does nothing; installing it is the only
+  # reason this script touches apt at all.
+  #
+  # Nothing here may kill apt/dpkg or upgrade the guest's packages. The sandbox
+  # runs its own apt at every boot (see
+  # /etc/durable-startup.d/001-startup-claude/001-cmd.sh) and is still installing
+  # its agent during its first start, so SIGKILLing dpkg - or running a blanket
+  # `apt upgrade` - there is how sandboxes were left unable to start again. The
+  # host no longer offers a "refresh packages" flag for the same reason: use
+  # docker-sbx-update-sandboxes.py for that, on a sandbox that is already up.
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "jq not found, installing it"
+    sudo apt update -y
+    sudo apt install jq -y
+  fi
 }
 
 set_env_if_missing() {
@@ -299,24 +266,37 @@ update_claude_code_settings() {
 
   tmpjson="$(mktemp "${targetjson}.tmp.XXXXXX" )" || exit 1
 
+  # Only the opt-outs are written, and only the ones that exist and mean something.
+  # DISABLE_TELEMETRY is read merely for being set (any non-empty value counts) and
+  # CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC covers the rest of the nonessential
+  # traffic, so those two are the opt-out. Deliberately not written:
+  #   CLAUDE_CODE_DISABLE_TELEMETRY  - not a Claude Code variable; DISABLE_TELEMETRY
+  #                                    is the real name, so this wrote a key nothing
+  #                                    reads
+  #   CLAUDE_CODE_ENABLE_TELEMETRY=0 - the variable exists to turn OpenTelemetry
+  #                                    export *on*, with "1"; export is already off
+  #                                    unless that is set, so "0" said nothing
+  # The survey line is redundant (Claude Code disables the survey when either of the
+  # two above is set) but kept: it says what it means without depending on that rule.
   set_env_if_missing DISABLE_TELEMETRY "1"
-  set_env_if_missing CLAUDE_CODE_ENABLE_TELEMETRY "0"
-  set_env_if_missing CLAUDE_CODE_DISABLE_TELEMETRY "1"
   set_env_if_missing CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC "1"
   set_env_if_missing CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY "1"
 
   #set_env_if_missing ANTHROPIC_API_KEY ""
 
+  # The attribution header is no longer inferred from the base URL. "0" was a
+  # workaround for claude before 2.1.181, where the attribution block carried a
+  # per-request token on custom base URLs; this template ships 2.1.280 and downloads
+  # a newer version at first start, so the reason is gone - and the branch that
+  # would have forced "1" otherwise was commented out, so neither value was ever
+  # really applied. A gateway that still needs it gets it from the -e env file, which
+  # the merge below passes through.
   if [[ ! -z "$ANTHROPIC_BASE_URL" ]]; then
-    set_env_if_missing CLAUDE_CODE_ATTRIBUTION_HEADER "0"
     set_env_if_missing ANTHROPIC_AUTH_TOKEN "setup_auth_token"
-  #else
-  #  set_env_if_missing CLAUDE_CODE_ATTRIBUTION_HEADER "1"
   fi
 
   echo "Updating Claude Code settings :"
   echo "  DISABLE_TELEMETRY = "${DISABLE_TELEMETRY}
-  echo "  CLAUDE_CODE_ENABLE_TELEMETRY = "${CLAUDE_CODE_ENABLE_TELEMETRY}
   echo "  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC}
   if [[ ! -z "$CLAUDE_CODE_ATTRIBUTION_HEADER" ]]; then
     echo "  CLAUDE_CODE_ATTRIBUTION_HEADER = "${CLAUDE_CODE_ATTRIBUTION_HEADER}
@@ -334,8 +314,6 @@ update_claude_code_settings() {
   if jq -e '
     .env //= {} |
     .env["DISABLE_TELEMETRY"] = $ENV.DISABLE_TELEMETRY |
-    .env["CLAUDE_CODE_ENABLE_TELEMETRY"] = $ENV.CLAUDE_CODE_ENABLE_TELEMETRY |
-    .env["CLAUDE_CODE_DISABLE_TELEMETRY"] = $ENV.CLAUDE_CODE_DISABLE_TELEMETRY |
     .env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = $ENV.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC |
     .env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"] = $ENV.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY |
     if ( $ENV.CLAUDE_CODE_ATTRIBUTION_HEADER != null and $ENV.CLAUDE_CODE_ATTRIBUTION_HEADER != "" ) then .env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = $ENV.CLAUDE_CODE_ATTRIBUTION_HEADER else . end |
@@ -349,16 +327,6 @@ update_claude_code_settings() {
     printf 'Error: could not update %s (is it valid JSON?) - file left unchanged\n' "$targetjson" >&2
     exit 1
   fi
-}
-
-setup_path() {
-  if [[ -z "$prjpath" ]]; then
-    return 0
-  fi
-
-  cd "$HOME"
-  rm -Rf ./workspace
-  ln -s "$prjpath" ./workspace
 }
 
 setup_env() {
@@ -381,10 +349,8 @@ EOF
 echo "Project path: $prjpath"
 
 load_env_file
-stop_apt
 install_tools
 update_claude_code_settings
 install_slack_hook
 cleanup_env_file
-setup_path
 setup_env

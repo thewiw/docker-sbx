@@ -2,8 +2,9 @@
 """Unit tests for docker-sbx-create-sandbox.py (standard library only).
 
 Covers the pure helpers the CLI relies on: argument parsing, the env-file reader,
-volume specs, Slack validation, host extraction, the secrets-file scanner and the
-minimal YAML profile parser. The end-to-end behaviour is covered separately by
+volume specs, Slack validation, host extraction, the secrets-file scanner, the
+minimal YAML profile parser, the sandbox-name pre-check and the wait for a new
+sandbox's first start. The end-to-end behaviour is covered separately by
 test/run-tests.sh, which runs the same assertions against the bash and Python
 implementations.
 
@@ -18,6 +19,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # The module name has hyphens, so it cannot be imported by name. The script sits
 # in the repository root, one level up from this test/ directory.
@@ -63,6 +65,14 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(cs.CliError) as caught:
             cs.parse_args(["--bogus"])
         self.assertIn("Unknown option: --bogus", str(caught.exception))
+
+    def test_the_removed_apt_flag_is_rejected_rather_than_ignored(self):
+        # `-u` used to gate an apt upgrade inside the sandbox; that apt run broke
+        # sandboxes that had not finished starting, so it is gone rather than a
+        # silently accepted no-op.
+        with self.assertRaises(cs.CliError) as caught:
+            cs.parse_args(["-n", "d", "-p", "/x", "-u", "true"])
+        self.assertIn("-u", str(caught.exception))
 
     def test_option_without_value_raises(self):
         with self.assertRaises(cs.CliError):
@@ -283,6 +293,383 @@ class SecretScannerTests(unittest.TestCase):
         nested.mkdir()
         (nested / ".git").mkdir()
         self.assertEqual(cs.find_git_dir(str(self.root)), str(nested / ".git"))
+
+
+class SecretsScanTests(unittest.TestCase):
+    """check_project_secrets_files() reads the -sf file through the module globals.
+
+    It called a `secretsfile()` accessor that was never defined, so every default
+    run died with NameError the moment the secret scan started - and the `-sf`
+    option never reached read_secrets_config at all, since nothing wired it up.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._config = cs.CONFIG
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.CONFIG = self._config
+        self._tmp.cleanup()
+
+    def _configure(self, *extra):
+        cs.CONFIG = cs.parse_args(["-n", "d", "-p", str(self.root), *extra])
+
+    def test_accessor_exposes_the_configured_file(self):
+        self._configure("-sf", "custom.json")
+        self.assertEqual(cs.secretsfile(), "custom.json")
+
+    def test_missing_sf_file_falls_back_to_the_defaults(self):
+        # main() rejects a missing -sf before getting here; called directly, the
+        # reader must degrade to the built-in patterns rather than to nothing.
+        self._configure("-sf", str(self.root / "missing.json"))
+        search, avoid = cs.read_secrets_config(cs.secretsfile())
+        self.assertEqual(tuple(search), cs.DEFAULT_SEARCH_PATTERNS)
+        self.assertEqual(tuple(avoid), cs.DEFAULT_AVOID_PATTERNS)
+
+    def test_clean_project_scans_without_raising(self):
+        self._configure()
+        (self.root / "src.py").write_text("")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cs.check_project_secrets_files()  # this used to be a NameError
+        self.assertIn("No secrets files detected", out.getvalue())
+
+    def test_the_sf_file_actually_drives_the_scan(self):
+        # Because the accessor was missing, -sf was silently ignored as well.
+        config = self.root / "s.json"
+        config.write_text(json.dumps({"search": ["*.token"], "avoid": []}))
+        (self.root / "creds.token").write_text("")
+        self._configure("-sf", str(config))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ), self.assertRaises(SystemExit):
+            cs.check_project_secrets_files()
+
+    def test_default_patterns_still_apply(self):
+        (self.root / "app.jks").touch()
+        self._configure()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            io.StringIO()
+        ), self.assertRaises(SystemExit):
+            cs.check_project_secrets_files()
+
+
+class SandboxListTests(unittest.TestCase):
+    """Sandbox names for the "already exists" check.
+
+    parse_table_names mirrors docker-sbx-update-sandboxes.py, so the two scripts
+    agree on what a name in `sbx ls`'s first column looks like.
+    """
+
+    def test_parses_the_first_column_of_the_human_table(self):
+        text = (
+            "SANDBOX       AGENT    STATUS    PORTS   WORKSPACE   CREATED\n"
+            "docker-sbx    claude   running           c:\\p        7h\n"
+            "sequoia-420   claude   stopped           C:\\u        1h\n"
+        )
+        self.assertEqual(cs.parse_table_names(text), ["docker-sbx", "sequoia-420"])
+
+    def test_headers_dividers_and_blanks_are_not_names(self):
+        self.assertEqual(cs.parse_table_names("NAME\n----\n\n"), [])
+
+    def test_names_only_output_wins_when_it_answers(self):
+        with mock.patch.object(cs, "run") as fake_run:
+            fake_run.return_value = mock.Mock(returncode=0, stdout="a\nb\n")
+            self.assertEqual(cs.existing_sandbox_names(), ["a", "b"])
+            self.assertEqual(fake_run.call_args[0][0], ["sbx", "ls", "-q"])
+
+    def test_empty_names_only_output_falls_back_to_the_table(self):
+        with mock.patch.object(cs, "run") as fake_run:
+            fake_run.side_effect = [
+                mock.Mock(returncode=0, stdout=""),
+                mock.Mock(returncode=0, stdout="SANDBOX\nx\n"),
+            ]
+            self.assertEqual(cs.existing_sandbox_names(), ["x"])
+
+
+class CreateSandboxTests(unittest.TestCase):
+    """A failed `sbx create` used to scroll past; an existing name is not reused."""
+
+    def setUp(self):
+        self._config = cs.CONFIG
+        cs.CONFIG = cs.parse_args(["-n", "d", "-p", "/x"])
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.CONFIG = self._config
+
+    def test_create_is_fatal_when_sbx_fails(self):
+        with mock.patch.object(cs, "existing_sandbox_names", return_value=[]), mock.patch.object(
+            cs, "sbx"
+        ) as fake_sbx:
+            cs.create_sandbox(["/docs:ro"])
+        argv, kwargs = fake_sbx.call_args
+        self.assertEqual(argv[0][:4], ["create", "--name", "d", "claude"])
+        self.assertEqual(argv[0][-1], "/docs:ro")
+        self.assertTrue(kwargs["check"])
+
+    def test_an_existing_name_is_refused_before_anything_is_created(self):
+        err = io.StringIO()
+        with mock.patch.object(
+            cs, "existing_sandbox_names", return_value=["d"]
+        ), mock.patch.object(cs, "sbx") as fake_sbx, contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            cs.create_sandbox([])
+        fake_sbx.assert_not_called()
+        self.assertIn("sbx rm d", err.getvalue())
+
+
+class SandboxReadinessTests(unittest.TestCase):
+    """Setup must not configure a sandbox whose first start is still running.
+
+    The first start is when the guest gets its agent, and the previous code ran the
+    setup straight after `sbx create` - into a sandbox mid-boot, which left ones
+    that could never be started again.
+    """
+
+    def setUp(self):
+        self._config = cs.CONFIG
+        self._dry = cs.DRY_RUN
+        cs.DRY_RUN = False
+        cs.CONFIG = cs.parse_args(["-n", "d", "-p", "/x"])
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.CONFIG = self._config
+        cs.DRY_RUN = self._dry
+
+    def test_the_probe_execs_in_and_tests_the_agent_binary(self):
+        with mock.patch.object(cs, "run") as fake_run:
+            fake_run.return_value = mock.Mock(returncode=0)
+            self.assertTrue(cs.sandbox_ready())
+            argv = fake_run.call_args[0][0]
+        self.assertEqual(argv[:3], ["sbx", "exec", "-i"])
+        self.assertIn("d", argv)
+        self.assertIn(".local/bin/claude", argv[-1])
+
+    def test_a_failing_probe_is_not_ready(self):
+        with mock.patch.object(cs, "run") as fake_run:
+            fake_run.return_value = mock.Mock(returncode=1)
+            self.assertFalse(cs.sandbox_ready())
+
+    def test_dry_run_does_not_probe_or_wait(self):
+        cs.DRY_RUN = True
+        with mock.patch.object(cs, "sandbox_ready") as probe:
+            self.assertTrue(cs.wait_for_sandbox())
+        probe.assert_not_called()
+
+    def test_waiting_stops_at_the_first_success(self):
+        with mock.patch.object(cs, "sandbox_ready", side_effect=[False, True]), mock.patch.object(
+            cs.time, "sleep"
+        ) as sleep, contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(cs.wait_for_sandbox())
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_waiting_gives_up_at_the_timeout(self):
+        # monotonic: the loop start, then past the deadline; the probe never passes.
+        clock = iter([0.0, 0.0, cs.SANDBOX_READY_TIMEOUT + 1])
+        with mock.patch.object(cs, "sandbox_ready", return_value=False), mock.patch.object(
+            cs.time, "monotonic", side_effect=clock
+        ), mock.patch.object(cs.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(cs.wait_for_sandbox())
+
+    def _setup_calls(self, *extra):
+        """Every `sbx` argv setup_sandbox() issues, with the wait stubbed out."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cs.CONFIG = cs.parse_args(["-n", "d", "-p", tmp, *extra])
+            with mock.patch.object(cs, "sbx") as fake_sbx, mock.patch.object(
+                cs, "wait_for_sandbox", return_value=True
+            ):
+                cs.setup_sandbox()
+            return [call[0][0] for call in fake_sbx.call_args_list], tmp
+
+    def test_the_sandbox_is_started_before_anything_runs_inside_it(self):
+        calls, _ = self._setup_calls()
+        self.assertEqual(calls[0], ["start", "d"])
+        self.assertTrue(any("exec" in call for call in calls))
+
+    def test_no_env_file_is_passed_as_a_dash_not_an_empty_argument(self):
+        # An empty positional does not survive `sbx exec` reliably, so the tail is
+        # <path> -.
+        calls, tmp = self._setup_calls()
+        bash = [call for call in calls if "bash" in call][0]
+        self.assertEqual(bash[-2], tmp)
+        self.assertEqual(bash[-1], "-")
+
+    def test_env_file_path_comes_second(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "sbx.env"
+            env.write_text("ANTHROPIC_API_KEY=x\n")
+            cs.CONFIG = cs.parse_args(["-n", "d", "-p", tmp, "-e", str(env)])
+            with mock.patch.object(cs, "sbx") as fake_sbx, mock.patch.object(
+                cs, "wait_for_sandbox", return_value=True
+            ):
+                cs.setup_sandbox()
+            calls = [call[0][0] for call in fake_sbx.call_args_list]
+        bash = [call for call in calls if "bash" in call][0]
+        self.assertEqual(bash[-2], tmp)  # project path first
+        self.assertEqual(bash[-1], "/home/agent/sbx.env")  # env-file path second
+        self.assertTrue(any("cp" in call for call in calls))
+
+    def test_a_sandbox_that_never_starts_is_not_configured(self):
+        err = io.StringIO()
+        with mock.patch.object(cs, "sbx") as fake_sbx, mock.patch.object(
+            cs, "wait_for_sandbox", return_value=False
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            err
+        ), self.assertRaises(SystemExit):
+            cs.setup_sandbox()
+        self.assertFalse([call for call in fake_sbx.call_args_list if "exec" in call[0][0]])
+        self.assertIn("did not start", err.getvalue())
+
+
+class RunHelperTests(unittest.TestCase):
+    """A binary that is not on PATH must not escape as a raw traceback."""
+
+    MISSING = "docker-sbx-no-such-binary-on-path"
+
+    def setUp(self):
+        self._dry = cs.DRY_RUN
+        cs.DRY_RUN = False
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.DRY_RUN = self._dry
+
+    def test_missing_binary_dies_with_a_message(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                cs.run([self.MISSING])
+        self.assertIn("command not found", err.getvalue())
+        self.assertIn(self.MISSING, err.getvalue())
+
+    def test_missing_binary_without_check_is_reported_as_a_failed_run(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            proc = cs.run([self.MISSING], check=False)
+        self.assertEqual(proc.returncode, 127)  # what a shell reports
+        self.assertEqual(proc.stdout, "")
+
+
+class SbxPreconditionTests(unittest.TestCase):
+    """Without sbx nothing can work, and every sbx() call is non-fatal by design.
+
+    Silently skipping them all and reporting success is the failure mode to avoid.
+    """
+
+    def test_main_stops_when_sbx_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with mock.patch.object(cs, "have", return_value=False), contextlib.redirect_stdout(
+                io.StringIO()
+            ), contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                cs.main(["-n", "d", "-p", tmp])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("sbx", err.getvalue())
+        self.assertIn("docker-sbx-install.py", err.getvalue())
+
+    def test_dry_run_does_not_need_sbx(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(cs, "have", return_value=False), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                self.assertEqual(cs.main(["--dry-run", "-n", "d", "-p", tmp]), 0)
+
+
+class GitleaksScanTests(unittest.TestCase):
+    """Telling a real finding apart from Docker not being usable.
+
+    gitleaks exits 0 for a clean repository and non-zero when it finds something,
+    so the bash original is `if ! docker run ...`. The port had drifted to
+    `if not <rc>` - the opposite - which aborted on a clean repo and let a leaking
+    one through.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / ".git").mkdir()
+        self._dry = cs.DRY_RUN
+        self._config = cs.CONFIG
+        cs.DRY_RUN = False
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.DRY_RUN = self._dry
+        cs.CONFIG = self._config
+        self._tmp.cleanup()
+
+    def _scan(self, daemon_rc, gitleaks_rc):
+        """Run the scan with `docker info` and gitleaks faked to those exit codes."""
+        cs.CONFIG = cs.parse_args(["-n", "d", "-p", str(self.root)])
+        run_results = [mock.Mock(returncode=daemon_rc, stdout=""), mock.Mock(returncode=gitleaks_rc)]
+        err = io.StringIO()
+        code, calls = None, []
+        with mock.patch.object(cs, "have", return_value=True), mock.patch.object(
+            cs, "run", side_effect=run_results
+        ) as fake_run, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            try:
+                cs.check_project_secrets_git()
+            except SystemExit as exc:
+                code = exc.code
+            calls = [c[0][0] for c in fake_run.call_args_list]
+        return code, err.getvalue(), calls
+
+    def test_clean_repository_continues(self):
+        # The regression: this used to abort for being clean.
+        code, err, _ = self._scan(daemon_rc=0, gitleaks_rc=0)
+        self.assertIsNone(code)
+        self.assertEqual(err, "")
+
+    def test_leaks_found_aborts(self):
+        code, err, _ = self._scan(daemon_rc=0, gitleaks_rc=1)
+        self.assertEqual(code, 1)
+        self.assertIn("leak", err)
+
+    def test_daemon_down_says_so_and_is_not_a_leak_report(self):
+        code, err, _ = self._scan(daemon_rc=1, gitleaks_rc=1)
+        self.assertEqual(code, 1)
+        self.assertIn("daemon", err)
+        self.assertNotIn("leak", err)
+
+    def test_the_daemon_is_checked_before_gitleaks_runs(self):
+        _, _, calls = self._scan(daemon_rc=1, gitleaks_rc=1)
+        self.assertEqual(calls, [["docker", "info"]])  # stopped before the scan
+
+    def test_daemon_down_says_how_to_start_it(self):
+        # Saying "start Docker Desktop" is not enough on its own; name the command.
+        with mock.patch.object(cs.os, "name", "nt"):
+            code, err, _ = self._scan(daemon_rc=1, gitleaks_rc=1)
+        self.assertEqual(code, 1)
+        self.assertIn("Docker Desktop", err)
+        self.assertIn("Start-Process", err)
+
+
+class DockerDaemonHintTests(unittest.TestCase):
+    """The start instructions must match the host, not a generic guess."""
+
+    def _lines(self, os_name, sys_platform):
+        with mock.patch.object(cs.os, "name", os_name), mock.patch.object(
+            cs.sys, "platform", sys_platform
+        ):
+            return "\n".join(cs.docker_daemon_start_lines())
+
+    def test_windows(self):
+        text = self._lines("nt", "win32")
+        self.assertIn("Docker Desktop", text)
+        self.assertIn("Start-Process", text)
+
+    def test_macos(self):
+        text = self._lines("posix", "darwin")
+        self.assertIn("open -a Docker", text)
+
+    def test_linux(self):
+        text = self._lines("posix", "linux")
+        self.assertIn("sudo systemctl start docker", text)
+        self.assertIn("sudo service docker start", text)  # the no-systemd fallback
 
 
 class ProfileParserTests(unittest.TestCase):

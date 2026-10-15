@@ -16,9 +16,14 @@ a stock Python 3.9+.
 Usage:
     sudo python3 docker-sbx-install.py          # Linux / WSL (needs root)
     python3 docker-sbx-install.py               # macOS (Homebrew refuses to run as root)
-    python  docker-sbx-install.py               # Windows (from an elevated terminal)
+    python  docker-sbx-install.py               # Windows, as a regular user
 
     python3 docker-sbx-install.py --dry-run     # print the commands, change nothing
+
+Windows needs no elevated terminal: Docker Desktop's and sbx's installers raise
+their own UAC prompt. Only enabling the Windows Hypervisor Platform needs
+administrator rights, and the script asks for that single command - and only when
+the feature turns out to be missing.
 """
 
 from __future__ import annotations
@@ -60,10 +65,39 @@ DOCKER_CONFLICTING_PACKAGES = (
 )
 
 # Docker Desktop is only needed on macOS/Windows for the host-side gitleaks
-# scan (`docker run` in docker-sbx-create-sandbox.sh); `sbx` itself is standalone.
+# scan (`docker run` in docker-sbx-create-sandbox.py); `sbx` itself is standalone.
 DOCKER_DESKTOP_CASK = "docker"
 DOCKER_DESKTOP_WINGET = "Docker.DockerDesktop"
 SBX_WINGET = "Docker.sbx"
+
+# winget exits non-zero when `install` finds the package already present and up to
+# date: it announces "already installed, attempting upgrade", finds no newer
+# version, and returns 0x8A15002B (APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE).
+# That is the state we want, not a failure.
+WINGET_ALREADY_SATISFIED = 0x8A15002B
+
+# Shown when winget cannot install Docker Desktop on Windows - the failure is
+# almost always a winget problem, not a Docker one, so the fix is to clean winget
+# first and only fall back to the manual installer afterwards.
+DOCKER_DESKTOP_WINDOWS_DOCS = "https://docs.docker.com/desktop/setup/install/windows-install/"
+
+# Windows Hypervisor Platform (WHPX). Local sandboxes need it, and enabling it is
+# the only step in this whole script that requires an elevated token. It is a
+# feature of its own: Hyper-V and the Virtual Machine Platform (WSL2) are separate
+# and enabling those does not turn WHPX on.
+HYPERVISOR_FEATURE = "HypervisorPlatform"
+
+# The DISM states that mean the feature is on. "EnablePending" is on-but-needs-a-
+# restart, which enabling again would not fix.
+HYPERVISOR_ENABLED_STATES = ("enabled", "enablepending")
+
+# Win32_OptionalFeature.InstallState, the unelevated way to read a feature's state.
+WIN32_OPTIONAL_FEATURE_STATES = {
+    "1": "Enabled",
+    "2": "Disabled",
+    "3": "Absent",
+    "4": "Unknown",
+}
 
 # Global network policy, applied once at install time. Sandboxes are allowed to
 # do system updates; the deny list names the code hosts explicitly so it keeps
@@ -100,11 +134,23 @@ def info(msg: str = "") -> None:
     print(msg)
 
 
+def _flush_stdout() -> None:
+    """Keep stderr in step with stdout.
+
+    stdout is block-buffered when the script's output is piped, while stderr is
+    not, so a warning or error would otherwise surface *before* the lines that
+    explain it.
+    """
+    sys.stdout.flush()
+
+
 def warn(msg: str) -> None:
+    _flush_stdout()
     print(f"Warning: {msg}", file=sys.stderr)
 
 
 def die(msg: str) -> "None":
+    _flush_stdout()
     print(f"Error: {msg}", file=sys.stderr)
     sys.exit(1)
 
@@ -151,19 +197,19 @@ def is_admin() -> bool:
 
 
 def require_admin() -> None:
-    """Check for the privilege this platform's steps need, and explain how to get it.
+    """Check for the privilege this platform's *install* steps need, and explain how.
 
     Deliberately check-and-instruct rather than self-elevating.
+
+    Windows is absent on purpose: nothing there needs the launching shell to be
+    elevated. Docker Desktop's and sbx's own installers raise a UAC prompt when
+    they need one, the environment variables are user-scoped, and the single step
+    that does need administrator rights - enabling the Windows Hypervisor Platform
+    - is checked, and only demanded, where it runs (see enable_hypervisor_platform).
+    A regular-user Windows install is therefore supported, exactly like installing
+    Docker Desktop by hand.
     """
     script = Path(sys.argv[0]).name
-
-    if PLATFORM == WINDOWS:
-        if is_admin():
-            return
-        banner("Error: this script must run from an elevated terminal")
-        info("Open Windows Terminal / PowerShell with 'Run as administrator', then run again:")
-        info(f"    python {script}")
-        sys.exit(1)
 
     if PLATFORM == MACOS:
         # Homebrew refuses to run as root, so here root is the error, not the fix.
@@ -174,11 +220,12 @@ def require_admin() -> None:
         info(f"    python3 {script}")
         sys.exit(1)
 
-    if is_admin():
-        return
-    banner("Error: This script must be run as root (use sudo)")
-    info(f"    sudo python3 {script}")
-    sys.exit(1)
+    if is_linux_like():
+        if is_admin():
+            return
+        banner("Error: This script must be run as root (use sudo)")
+        info(f"    sudo python3 {script}")
+        sys.exit(1)
 
 
 # --------------------------------------------------------------------------
@@ -208,6 +255,26 @@ def run(cmd, *, check: bool = True, capture: bool = False):
 
 def have(command: str) -> bool:
     return shutil.which(command) is not None
+
+
+def winget_install(package: str, *, silent: bool = False) -> int:
+    """Install a winget package; return 0 when it ends up installed.
+
+    A package that is already there *and* up to date makes winget exit non-zero
+    (see WINGET_ALREADY_SATISFIED). That is the state we want, so it is reported
+    as success instead of aborting the installation or, worse, printing the
+    "installation failed" recovery guide for a machine that is already set up.
+    """
+    argv = ["winget", "install"]
+    if silent:
+        argv.append("-h")
+    argv += ["--accept-package-agreements", "--accept-source-agreements", package]
+
+    proc = run(argv, check=False)
+    if proc.returncode == WINGET_ALREADY_SATISFIED:
+        info(f"{package} is already installed and up to date, nothing to do")
+        return 0
+    return proc.returncode
 
 
 def confirm(prompt: str) -> bool:
@@ -244,8 +311,45 @@ def write_file(path: Path, content: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def _windows_docker_candidates():
+    """Where Docker Desktop drops docker.exe, per-machine or per-user install.
+
+    Docker Desktop adds its CLI to PATH, but the installer's PATH change only
+    reaches processes started *afterwards*: a terminal (or the IDE that launched
+    one) opened earlier keeps the environment it inherited and sees no `docker`.
+    Looking in the install locations too is what separates "Docker is not
+    installed" from "Docker is installed but not on this shell's PATH".
+    """
+    for root in (
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles(x86)"),
+        os.environ.get("LOCALAPPDATA"),
+    ):
+        if not root:
+            continue
+        for middle in (("Docker", "Docker"), ("Programs", "Docker", "Docker")):
+            yield Path(root).joinpath(*middle, "resources", "bin", "docker.exe")
+
+
+def docker_binary() -> str:
+    """The docker CLI path, or "" when Docker really is absent.
+
+    PATH first - that is what every later `docker ...` call relies on - then
+    Docker Desktop's install directories on Windows.
+    """
+    found = shutil.which("docker")
+    if found:
+        return found
+    if PLATFORM == WINDOWS:
+        for candidate in _windows_docker_candidates():
+            if candidate.is_file():
+                return str(candidate)
+    return ""
+
+
 def docker_installed() -> bool:
-    return have("docker")
+    return bool(docker_binary())
 
 
 def docker_version() -> str:
@@ -362,16 +466,62 @@ def install_docker_desktop_guarded() -> None:
     banner("Docker Desktop")
     info(
         "The host needs Docker for the secret scan (docker run ... gitleaks) that "
-        "docker-sbx-create-sandbox.sh performs."
+        "docker-sbx-create-sandbox.py performs."
     )
     if not confirm("🔍 Install Docker Desktop [y/N] "):
         info("Docker Desktop installation skipped.")
         warn(
             "the host secret scan will not work until Docker is installed - "
-            "docker-sbx-create-sandbox.sh -s false skips it in the meantime"
+            "docker-sbx-create-sandbox.py -s false skips it in the meantime"
         )
         return
     install_docker_desktop()
+
+
+def winget_docker_help(returncode: int) -> None:
+    """Explain how to recover when winget cannot install Docker Desktop.
+
+    The common Windows failure is a stale or corrupt winget source index, reported
+    as 0x8a15000f ("the source is missing required data"), which makes winget claim
+    no package was found even though the package exists. Cleaning the source fixes
+    most cases; when it does not, Docker Desktop has to be installed by hand.
+    """
+    banner("Docker Desktop installation failed")
+    info(f"winget exited with code {returncode} while installing {DOCKER_DESKTOP_WINGET}.")
+    info()
+    info("On Windows this is nearly always a stale or corrupt winget source index, and it")
+    info("makes winget report that no package was found even though the package exists")
+    info("(error 0x8a15000f: 'the source is missing required data'). Repair the source")
+    info("first, in an ELEVATED (Administrator) PowerShell:")
+    info()
+    info("  winget source reset --force")
+    info("  winget source update")
+    info("  winget source list")
+    info()
+    info("then retry the install:")
+    info()
+    info(
+        "  winget install --accept-package-agreements --accept-source-agreements "
+        f"{DOCKER_DESKTOP_WINGET}"
+    )
+    info()
+    info("If 'winget source list' is still empty or errors, the App Installer package is")
+    info("the broken part: repair it from Settings > Apps > App Installer > Advanced")
+    info("options > Repair (then Reset if Repair does not help), or reinstall App Installer")
+    info("from the Microsoft Store. Check with 'winget --version' before retrying.")
+    info()
+    info("IF IT STILL DOES NOT WORK AFTER THAT CLEANUP, install Docker Desktop by hand,")
+    info("following the official instructions:")
+    info()
+    info(f"  {DOCKER_DESKTOP_WINDOWS_DOCS}")
+    info()
+    info("Docker Desktop needs WSL2 or Hyper-V enabled, and a reboot afterwards.")
+    info()
+    info("Once it is installed, CLOSE THIS TERMINAL AND OPEN A NEW ONE, then re-run this")
+    info("script. The installer only adds the docker command to the PATH of terminals")
+    info("started after it runs, so this shell would still not see Docker - the script")
+    info("would fall back to offering the install again.")
+    die("Docker Desktop could not be installed by winget")
 
 
 def install_docker_desktop() -> None:
@@ -383,8 +533,19 @@ def install_docker_desktop() -> None:
         run(["brew", "install", "--cask", DOCKER_DESKTOP_CASK])
     else:
         if not have("winget"):
-            die("winget is required to install Docker Desktop - install 'App Installer' from the Microsoft Store")
-        run(["winget", "install", "--accept-package-agreements", "--accept-source-agreements", DOCKER_DESKTOP_WINGET])
+            die(
+                "winget is required to install Docker Desktop - install 'App Installer' from "
+                "the Microsoft Store, or install Docker Desktop by hand following "
+                f"{DOCKER_DESKTOP_WINDOWS_DOCS} and then restart your terminal"
+            )
+        # winget_install reports "already installed and up to date" as success; a
+        # real failure is worth the full recovery guide rather than the bare
+        # "command failed with exit code ..." that run() would print. On a broken
+        # winget the sbx install below fails for the same reason, so stopping here
+        # is right.
+        code = winget_install(DOCKER_DESKTOP_WINGET)
+        if code != 0:
+            winget_docker_help(code)
 
 
 def update_docker_desktop() -> None:
@@ -403,13 +564,22 @@ def install_or_update_docker() -> None:
 
     A refusal to update is not an error: the rest of the installation carries on.
     """
-    if not docker_installed():
+    binary = docker_binary()
+    if not binary:
         install_docker()
         return
 
     banner("Docker is already installed on this system")
-    info(f"Binary  : {shutil.which('docker')}")
+    info(f"Binary  : {binary}")
     info(f"Version : {docker_version()}")
+    if shutil.which("docker") is None:
+        # Found on disk but not on PATH: this shell (or whatever launched it)
+        # predates the installer's PATH change. Nothing is wrong with the install.
+        info()
+        warn(
+            "the `docker` command is not on this shell's PATH - open a NEW terminal "
+            "before relying on it; the installation itself is complete"
+        )
     info()
     info("It will be updated in place: existing images and containers are kept.")
 
@@ -456,23 +626,134 @@ def install_sbx() -> None:
     else:
         if not have("winget"):
             die("winget is required to install sbx - install 'App Installer' from the Microsoft Store")
-        run(["winget", "install", "-h", "--accept-package-agreements", "--accept-source-agreements", SBX_WINGET])
+        code = winget_install(SBX_WINGET, silent=True)
+        if code != 0:
+            die(f"winget failed to install {SBX_WINGET} (exit code {code})")
         enable_hypervisor_platform()
 
 
-def enable_hypervisor_platform() -> None:
-    """Windows only: local sandboxes need the Hypervisor Platform feature."""
-    banner("Enabling Windows Hypervisor Platform (required for local sandboxes)")
-    run(
+def hypervisor_platform_state() -> str:
+    """Windows only: the Windows Hypervisor Platform state, readable unelevated.
+
+    Get-WindowsOptionalFeature -Online is the obvious call and the one Docker's
+    instructions use, but it needs administrator rights *even to read* - it opens
+    protected system files - so from a regular-user shell it dies with "Access is
+    denied" and the feature looks missing. That is exactly how an enabled machine
+    was told to enable it. Win32_OptionalFeature is readable by standard users;
+    its InstallState is 1=Enabled, 2=Disabled, 3=Absent, 4=Unknown.
+
+    The raw value is returned rather than a bool: it is the only evidence when the
+    answer is surprising, and a bare False hid it.
+    """
+    # Deliberately no double quotes in the -Command string: it is passed as one argv
+    # element, and mixing the two quote styles with the Windows command-line rules
+    # is fragile.
+    proc = run(
         [
             "powershell",
             "-NoProfile",
             "-Command",
-            "Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All",
+            "(Get-CimInstance -ClassName Win32_OptionalFeature | "
+            f"Where-Object Name -eq '{HYPERVISOR_FEATURE}').InstallState",
         ],
         check=False,
+        capture=True,
     )
-    warn("a reboot may be required before local sandboxes can start")
+    if proc.returncode != 0:
+        return ""
+    raw = (proc.stdout or "").strip()
+    return WIN32_OPTIONAL_FEATURE_STATES.get(raw, raw)
+
+
+def hypervisor_state_is_enabled(state: str) -> bool:
+    """Is this DISM state one where the feature is on?
+
+    "EnablePending" means it is switched on but only takes effect after a restart -
+    enabling it again would not help, so it counts as enabled.
+    """
+    return state.strip().lower() in HYPERVISOR_ENABLED_STATES
+
+
+def enable_hypervisor_platform() -> None:
+    """Windows only: local sandboxes need the Windows Hypervisor Platform (WHPX).
+
+    This is the one step that genuinely needs an elevated token -
+    Enable-WindowsOptionalFeature does not raise a UAC prompt by itself. The
+    feature is read first (which needs no privilege) and elevation is only asked
+    for when it is actually missing.
+
+    WHPX is NOT Hyper-V, and NOT the Virtual Machine Platform that WSL2 uses:
+    enabling either of those does not turn WHPX on, which is why a machine that
+    "has the hypervisor" still lands here. Only *local* sandboxes need it; cloud
+    sandboxes work without it.
+    """
+    banner("Enabling Windows Hypervisor Platform (required for local sandboxes)")
+
+    if DRY_RUN:
+        info(f"  (dry-run: would read the {HYPERVISOR_FEATURE} state, and enable it only")
+        info("   if it is off - that step alone needs an elevated terminal)")
+        return
+
+    state = hypervisor_platform_state()
+
+    if hypervisor_state_is_enabled(state):
+        if state.strip().lower() == "enablepending":
+            warn("the Windows Hypervisor Platform is on, but only after a restart")
+            info("Restart Windows before starting a local sandbox.")
+        else:
+            info(f"{HYPERVISOR_FEATURE} is already enabled, nothing to do")
+        return
+
+    if not state:
+        # An unreadable probe must NOT block the install: the check can fail for
+        # reasons that say nothing about the feature itself - it once did, on a
+        # machine where the feature was already on. Say how to check by hand and
+        # carry on rather than sending the user to enable something they have.
+        warn(f"could not determine whether {HYPERVISOR_FEATURE} is enabled")
+        info("Local sandboxes need the Windows Hypervisor Platform. Check it from an")
+        info("ELEVATED PowerShell - reading it needs admin rights too - and enable it")
+        info("if it is not on:")
+        info()
+        info(f"  (Get-WindowsOptionalFeature -Online -FeatureName {HYPERVISOR_FEATURE}).State")
+        info(f"  Enable-WindowsOptionalFeature -Online -FeatureName {HYPERVISOR_FEATURE} -All")
+        info()
+        info("Restart Windows if you are asked to. Cloud sandboxes do not need this feature.")
+        return
+
+    if not is_admin():
+        banner("Error: enabling the Windows Hypervisor Platform needs an elevated terminal")
+        info(f"{HYPERVISOR_FEATURE} reports its state as: {state}")
+        info()
+        info(f"Local sandboxes need it. Note this is not Hyper-V and not the Virtual Machine")
+        info("Platform that WSL2 uses - having either of those does not enable it.")
+        info("Docker's instructions call for an elevated PowerShell prompt (Run as administrator):")
+        info()
+        info(f"  Enable-WindowsOptionalFeature -Online -FeatureName {HYPERVISOR_FEATURE} -All")
+        info()
+        info("Restart Windows if you are asked to, then run this script again.")
+        info("(Cloud sandboxes do not need this feature.)")
+        sys.exit(1)
+
+    # -NoRestart keeps this script from blocking on the "restart now?" prompt of an
+    # interactive run; the restart is reported to the user instead.
+    proc = run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f"Enable-WindowsOptionalFeature -Online -FeatureName {HYPERVISOR_FEATURE} -All -NoRestart",
+        ],
+        check=False,
+        capture=True,
+    )
+    if proc.returncode != 0:
+        die(
+            f"could not enable {HYPERVISOR_FEATURE} (exit code {proc.returncode}) - run it by "
+            "hand from an elevated PowerShell: Enable-WindowsOptionalFeature -Online "
+            f"-FeatureName {HYPERVISOR_FEATURE} -All"
+        )
+    info(f"{HYPERVISOR_FEATURE} enabled")
+    warn("restart Windows before starting a local sandbox")
 
 
 def sbx_login() -> None:
@@ -608,7 +889,10 @@ def main(argv=None) -> int:
     if DRY_RUN:
         info("dry-run: nothing will be changed")
 
-    require_admin()
+    # --dry-run changes nothing, so it must never demand privilege: asking for an
+    # elevated shell merely to *print* the plan would be absurd (and used to happen).
+    if not DRY_RUN:
+        require_admin()
     install_or_update_docker()
     install_sbx()
     sbx_login()

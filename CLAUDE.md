@@ -15,15 +15,17 @@ Scripts that run on the **host** live in the repository root and are run from th
 | Script / Directory | Purpose |
 |--------|---------|
 | `docker-sbx-install.sh` | One-time host setup. Installs Docker CE and the `docker-sbx` engine, creates a `kvm` group user, and sets default network policies (deny-all, allow only Ubuntu archives and Docker download). Must be run with `sudo`. |
-| `docker-sbx-install.py` | Cross-platform replacement for `docker-sbx-install.sh`, runnable on Linux/WSL, macOS and Windows (Python 3.9+, standard library only). Does the same setup: installs or updates Docker, installs the `sbx` CLI, signs in, sets the global network policy, and persists the environment variables. `--dry-run` prints every command and changes nothing. Needs `sudo` on Linux and an elevated terminal on Windows; Homebrew refuses to run as root on macOS. |
+| `docker-sbx-install.py` | Cross-platform replacement for `docker-sbx-install.sh`, runnable on Linux/WSL, macOS and Windows (Python 3.9+, standard library only). Does the same setup: installs or updates Docker, installs the `sbx` CLI, signs in, sets the global network policy, and persists the environment variables. `--dry-run` prints every command and changes nothing, and needs no privilege on any platform. Needs `sudo` on Linux; runs as a regular user on Windows and macOS (Homebrew refuses to run as root). The only Windows step needing administrator rights — enabling the Windows Hypervisor Platform — is probed first and demanded only when the feature is missing. |
 | `docker-sbx-create-sandbox.sh` | Creates a new sandbox for a project. Scans the project for secrets (file patterns + gitleaks), runs `sbx create`, then copies `sandbox/docker-sbx-setup-sandbox.sh` into the sandbox and executes it. Optionally applies per-sandbox policy profiles. |
-| `docker-sbx-create-sandbox.py` | Cross-platform replacement for `docker-sbx-create-sandbox.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options and the same user-facing messages; `--dry-run` prints every command and creates nothing. Profiles are YAML: PyYAML is used when importable, otherwise a small parser covers the documented profile subset. |
-| `sandbox/docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox. Stops any running `apt` processes, updates packages, installs `jq`, writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`, and symlinks `~/workspace` to the project path on the host. Also installs the optional Slack notification hook when the env file asks for it. |
+| `docker-sbx-create-sandbox.py` | Cross-platform replacement for `docker-sbx-create-sandbox.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options and the same user-facing messages; `--dry-run` prints every command and creates nothing. Profiles are YAML: PyYAML is used when importable, otherwise a small parser covers the documented profile subset. It waits for the new sandbox's first start to finish before configuring it, refuses to reuse an existing sandbox name, and treats a failed `sbx create` as fatal — the bash version's `sbx()` calls are non-fatal (mirroring the original), so a failed create used to be followed by setup against the *previous* sandbox of that name. |
+| `sandbox/docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox, after the host has waited for the sandbox's first start to finish. Takes the project path and an optional env-file path (or `-`). Installs `jq` **only if it is missing** — that is the only `apt` use, and it never kills `apt`/`dpkg` or upgrades packages, because the sandbox runs its own `apt` at boot (`/etc/durable-startup.d/001-startup-claude/001-cmd.sh`) and is still installing its agent during that first start. Writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`. It deliberately does **not** create a `~/workspace` symlink: the project is already mounted at its host path. Also installs the optional Slack notification hook when the env file asks for it. |
 | `sandbox/docker-sbx-slack-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/slack-notify.sh`. Invoked by Claude Code as a hook with the event payload on stdin; posts one short line per lifecycle event to Slack. Only installed when the optional feature is enabled via the env file. |
 | `docker-sbx-update-sandboxes.sh` | Maintenance helper. Runs `apt update/upgrade/autoremove` inside existing sandboxes via `sbx exec`, one at a time. Enumerates with `sbx ls` (or a custom `SBX_LS_CMD`), selectable with `-i`/`-x`; `DRY_RUN=1` prints instead of running. Not part of sandbox creation. |
+| `docker-sbx-update-sandboxes.py` | Cross-platform replacement for `docker-sbx-update-sandboxes.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options, the same user-facing messages and the same exit codes (0 clean, 1 when a sandbox fails, 2 on bad usage); adds a `--dry-run` flag alongside `DRY_RUN=1`. Lists sandboxes from `SBX_LS_CMD`, then `sbx ls -q`, then `sbx ls --json`, then the human-readable table — the JSON branch walks the parsed document itself, so `jq` is no longer needed. `SBX_LS_CMD` runs through the platform shell (`sh -c`, or `cmd /c` on Windows); the `sh -c` handed to `sbx exec` stays `sh -c`, since that one runs inside the sandbox. |
 | `test/run-tests.sh` | Test suite for the Slack notification feature, the env-file contract and the `create-sandbox` CLI. Exercises the hook, the settings merge, failure logging, and a real POST to a loopback sink. The CLI-level tests (1-12) run against **both** the bash and Python implementations, so the two cannot drift apart; `SBX_IMPLS=python` restricts it to one. Run directly on the host (`bash test/run-tests.sh`); no sandbox required. |
 | `test/test_docker_sbx_install.py` | Unit tests for the pure helpers in `docker-sbx-install.py` (prompt parsing, platform/locale selection, profile path, environment-block idempotency). Run with `python3 -m unittest discover -s test -p 'test_*.py'`. |
-| `test/test_create_sandbox.py` | Unit tests for the pure helpers in `docker-sbx-create-sandbox.py` (argument parsing, env-file reading, volume specs, Slack validation, host extraction, the secrets-file scanner and the minimal YAML profile parser). Same command as above. |
+| `test/test_create_sandbox.py` | Unit tests for the pure helpers in `docker-sbx-create-sandbox.py` (argument parsing, env-file reading, volume specs, Slack validation, host extraction, the secrets-file scanner, the minimal YAML profile parser, the sandbox-name pre-check and the wait for a sandbox's first start). Same command as above. |
+| `test/test_update_sandboxes.py` | Unit tests for the pure helpers in `docker-sbx-update-sandboxes.py` (list normalisation, CLI parsing and its exit-2 messages, the apt chain, exec-flag detection, and the three sandbox-name extraction paths). Same command as above; needs no `sbx` and no sandbox. |
 | `profiles/` | YAML policy profiles used by `docker-sbx-create-sandbox.sh` to grant a sandbox access to language-specific external resources. |
 
 ## Security Model
@@ -47,7 +49,7 @@ Scripts that run on the **host** live in the repository root and are run from th
 - `-profile` comma-separated list of policy profile names to apply, e.g. `python` or `python,java` (optional). Profiles are applied in the order given.
 - `-profile-directory` path to a directory containing profile YAML files (optional; default is `./profiles` next to the script).
 
-Project files will be available at `~/workspace` inside the sandbox. Extra volumes passed via `-v` are reachable at their own absolute host paths.
+Project files will be available inside the sandbox at the same absolute path they have on the host (`sbx` mounts the project there; a Windows `C:\…` path appears as `/c/…`), and that is where the agent starts. Extra volumes passed via `-v` are reachable at their own absolute host paths. There is no `~/workspace` symlink.
 
 ## Policy Profiles
 
@@ -118,7 +120,7 @@ ANTHROPIC_BASE_URL=http://host.docker.internal:11434
 ANTHROPIC_AUTH_TOKEN=ollama
 ```
 
-When `ANTHROPIC_BASE_URL` is set, the setup script disables the attribution header and sets `ANTHROPIC_AUTH_TOKEN`.
+When `ANTHROPIC_BASE_URL` is set, the setup script sets `ANTHROPIC_AUTH_TOKEN`.
 
 ## Slack Notifications (optional)
 
@@ -167,12 +169,12 @@ Things to keep in mind when editing this feature:
 
 ## Claude Code Settings Written by Setup
 
-`sandbox/docker-sbx-setup-sandbox.sh` writes the following to `~/.claude/settings.json` inside the sandbox:
+`sandbox/docker-sbx-setup-sandbox.sh` writes these opt-outs into `~/.claude/settings.json` inside the sandbox:
 
 - `DISABLE_TELEMETRY=1`
-- `CLAUDE_CODE_ENABLE_TELEMETRY=0`
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
-- `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1`
-- `CLAUDE_CODE_ATTRIBUTION_HEADER=1` (or `0` when using a custom base URL)
+- `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1` (redundant with the two above, kept for what it says)
+
+It does **not** write `CLAUDE_CODE_ENABLE_TELEMETRY` (that variable turns OpenTelemetry export *on* with `1`; export is already off unless it is set, so a `0` said nothing) or `CLAUDE_CODE_DISABLE_TELEMETRY` (not a Claude Code variable — `DISABLE_TELEMETRY` is the real name, so the key was never read). It also no longer sets `CLAUDE_CODE_ATTRIBUTION_HEADER`: the `0` was a workaround for claude before 2.1.181, where the attribution block carried a per-request token on custom base URLs, and the template ships 2.1.280 (a newer version is downloaded at first start). A value supplied in the `-e` env file is still passed through.
 
 Optionally injects `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL`.

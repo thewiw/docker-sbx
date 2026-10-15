@@ -1,0 +1,12 @@
+# Force LF in the repository and on checkout for every text file.
+#
+# Everything tracked here is a shell script, a YAML profile, or Markdown. A CRLF
+# checkout breaks direct execution:
+#     ./docker-sbx-install.sh: /bin/bash^M: bad interpreter: No such file or directory
+# and a Windows/WSL clone would otherwise reintroduce exactly that (and the
+# whole "is it true\r?" class of bug the sandbox scripts already guard against).
+# `text=auto` still lets git treat a genuine binary as binary; there are none today.
+* text=auto eol=lf
+
+# The load-bearing case: scripts run through their shebang.
+*.sh text eol=lf

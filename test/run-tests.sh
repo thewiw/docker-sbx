@@ -696,6 +696,49 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# TEST 19: the settings merge writes the opt-outs, and invents nothing
+# ----------------------------------------------------------------------
+echo "TEST 19: the settings merge writes the opt-outs and nothing invented"
+MERGE_FNS="$TMPDIR/merge-fns.sh"
+# set_env_if_missing through update_claude_code_settings: the merge needs both.
+sed -n '/^set_env_if_missing() {/,/^setup_env() {/p' "$SCRIPTS_DIR/sandbox/docker-sbx-setup-sandbox.sh" | head -n -1 > "$MERGE_FNS"
+MERGE_HOME="$TMPDIR/merge-home"
+mkdir -p "$MERGE_HOME/.claude"
+printf '{}\n' > "$MERGE_HOME/.claude/settings.json"
+
+merge_env() { jq -r --arg k "$1" '.env[$k] // "absent"' "$MERGE_HOME/.claude/settings.json" 2>/dev/null; }
+run_merge() {
+  # These three are cleared: the merge passes a value through when one is already
+  # exported, so an ambient copy would decide the "invents nothing" checks below
+  # instead of the script.
+  HOME="$MERGE_HOME" env -u CLAUDE_CODE_ATTRIBUTION_HEADER -u CLAUDE_CODE_ENABLE_TELEMETRY \
+    -u CLAUDE_CODE_DISABLE_TELEMETRY bash -c "source '$MERGE_FNS'; update_claude_code_settings" >/dev/null 2>&1 || true
+}
+
+run_merge
+if [[ "$(merge_env DISABLE_TELEMETRY)" == "1" && "$(merge_env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)" == "1" ]]; then
+  pass "Writes the two documented opt-outs"
+else
+  fail "Opt-outs missing: $(jq -c '.env' "$MERGE_HOME/.claude/settings.json" 2>/dev/null)"
+fi
+# Each of these was either not a Claude Code variable or a value that says nothing.
+for key in CLAUDE_CODE_DISABLE_TELEMETRY CLAUDE_CODE_ENABLE_TELEMETRY CLAUDE_CODE_ATTRIBUTION_HEADER; do
+  if [[ "$(merge_env "$key")" == "absent" ]]; then
+    pass "Does not invent $key"
+  else
+    fail "$key was written as '$(merge_env "$key")'"
+  fi
+done
+# ...but a value the env file supplies is still carried through.
+HOME="$MERGE_HOME" CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
+  bash -c "source '$MERGE_FNS'; update_claude_code_settings" >/dev/null 2>&1 || true
+if [[ "$(merge_env CLAUDE_CODE_ATTRIBUTION_HEADER)" == "0" ]]; then
+  pass "Passes a supplied CLAUDE_CODE_ATTRIBUTION_HEADER through"
+else
+  fail "A supplied CLAUDE_CODE_ATTRIBUTION_HEADER was dropped"
+fi
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 echo ""

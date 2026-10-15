@@ -13,7 +13,7 @@ Tested on :
 
 Host scripts (install / create / update / test) live in the repository root and must be run
 from that directory. Scripts that run **inside** a sandbox live in `sandbox/`; they are staged
-in automatically by `docker-sbx-create-sandbox.sh` and are not run on the host.
+in automatically by `docker-sbx-create-sandbox.py` and are not run on the host.
 
 
 ## Install engine
@@ -26,16 +26,78 @@ The cross-platform installer (Linux, WSL, macOS, Windows) needs Python 3.9+:
 
     sudo python3 docker-sbx-install.py     # Linux / WSL
     python3 docker-sbx-install.py          # macOS
-    python  docker-sbx-install.py          # Windows, from an elevated terminal
+    python  docker-sbx-install.py          # Windows, as a regular user
 
 Add `--dry-run` to print every command without changing anything. The script installs or
 updates Docker, installs the `sbx` CLI, signs you in (at one point you will need your docker
 account), sets the global network policy, and persists the environment variables.
 
-The Linux-only bash version, `./docker-sbx-install.sh`, is kept while the Python port is
-validated; it does the same thing, without macOS/Windows support.
+`--dry-run` needs no special privilege on any platform. On Windows neither does the install:
+Docker Desktop's and `sbx`'s installers raise their own UAC prompt when they need one. The
+only step that requires an elevated terminal is enabling the **Windows Hypervisor Platform**,
+which local sandboxes need — `Enable-WindowsOptionalFeature` cannot prompt for itself. The
+script reads that feature's state first and asks you to run one command as administrator only
+when it is actually off. (Docker Desktop has no need for this feature and does not enable it.)
+
+**Windows Hypervisor Platform is its own feature.** It is *not* Hyper-V, and *not* the Virtual
+Machine Platform that WSL 2 uses — having either of those does not turn it on, so a machine
+that "already has the hypervisor" can still need this step. To check and enable it yourself, in
+an **elevated** PowerShell:
+
+```powershell
+(Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform).State
+Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
+```
+
+Restart Windows if prompted. `EnablePending` in the first command's output means it is on but
+waiting for that restart. Only **local** sandboxes need this; cloud sandboxes do not.
+
+Reading the state needs administrator rights too — for a standard user
+`Get-WindowsOptionalFeature -Online` fails with *Access is denied*, which makes an enabled
+feature look missing. The script therefore reads it through `Win32_OptionalFeature`, which
+standard users can query, and it will not block the install if that read fails: it warns and
+tells you how to check by hand instead.
 
 At the end of installation, all network communication from the sandboxes is prohibited, except for system updates
+
+### Windows: winget fails with `0x8a15000f`
+
+On Windows the installer uses `winget` both for Docker Desktop and for the `sbx` CLI. If
+`winget` itself is unhealthy you get, right after answering `y` to the Docker Desktop prompt:
+
+    Échec lors de la recherche de la source : winget
+    0x8a15000f : Il manque des données requises par la source
+    Aucun package n'a été trouvé parmi les sources de travail.
+
+`0x8a15000f` is `APPINSTALLER_CLI_ERROR_SOURCE_DATA_MISSING`: winget's **source catalog cannot be
+loaded**, so it reports "no package found" for a package that does exist. This is a winget-side
+problem, not a script problem — no installer option works around it. Fix the source first, in an
+**elevated** (Administrator) PowerShell:
+
+    winget source reset --force
+    winget source update
+    winget source list
+
+`source reset --force` rebuilds the stale local index; `source list` should then show `msstore`
+and `winget`. Retry `winget install Docker.DockerDesktop`, or simply re-run the installer.
+
+If `source list` is still empty or errors, the *App Installer* package is the broken part: repair
+it from **Settings → Apps → App Installer → Advanced options → Repair**, then **Reset** if Repair
+does not help, or reinstall *App Installer* from the Microsoft Store. Check with `winget --version`
+before retrying.
+
+Failing that, install Docker Desktop by hand from
+<https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe>. Docker Desktop needs
+WSL2 or Hyper-V enabled, and a reboot afterwards.
+
+**Close the terminal and open a new one** before re-running the installer. The Docker Desktop
+installer adds the `docker` command to PATH, but that change only reaches terminals started
+afterwards — a shell that was already open keeps the environment it inherited, so `docker` still
+resolves to nothing there and the installer would offer to install Docker again. In a fresh
+terminal it detects the existing Docker and skips the winget step.
+
+Get winget healthy **before** re-running the whole script: the `sbx` CLI is installed through the
+same source, so it fails with the identical error a few steps later.
 
 
 ## Create a sandbox
@@ -57,10 +119,10 @@ The cross-platform Python version (Linux, WSL, macOS, Windows) takes exactly the
 
     python3 docker-sbx-create-sandbox.py -n test01 -p /absolute/project/path
 
-Add `--dry-run` to print every command without creating anything. `./docker-sbx-create-sandbox.sh` is kept while the Python port is validated.
+Add `--dry-run` to print every command without creating anything.
 
 ```
-./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -v {path} -profile {comma-separated profile names} -profile-directory {path to profile directory} :
+python3 docker-sbx-create-sandbox.py -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -v {path} -profile {comma-separated profile names} -profile-directory {path to profile directory} :
   -n                  : name of the sandbox [[mandatory]]
   -p                  : absolute path of the project's files [[mandatory]]
   -e                  : path to environment file [[optional]]
@@ -72,60 +134,75 @@ Add `--dry-run` to print every command without creating anything. `./docker-sbx-
   -profile-directory  : directory containing profile YAML files [[optional, default: ./profiles]]
 ```
 
+The setup step **waits for the sandbox's first start to finish** before configuring it. That first
+start is when the guest gets its agent — the `claude` binary is downloaded then, so it can take a
+while — and when the sandbox runs its own `apt` hooks. Touching the sandbox in the middle of that
+window is what used to leave sandboxes that could not be started again, so `docker-sbx` waits for
+it and then configures the sandbox.
+
+Nothing `docker-sbx` does inside a sandbox kills `apt`/`dpkg` or runs `apt upgrade`: only `jq` is
+installed, and only when it is actually missing (the template ships it). To refresh a sandbox's
+packages after the fact, use `docker-sbx-update-sandboxes.py`, which runs on a sandbox that is
+already up.
+
 Extra volumes passed with `-v` are mounted **read-only by default**; append `:rw` to mount read-write (or `:ro` to be explicit). Each path is mounted inside the sandbox at the same absolute path it has on the host. Repeat `-v` for several mounts.
 
-In the end, project's files should be available within `~/workspace` in the sandbox.
+The project is mounted where `sbx` puts it: the same absolute path it has on the host (a Windows
+`C:\...` path is visible inside the sandbox as `/c/...`), and that is the directory the agent
+starts in and the default working directory of `sbx exec`. `docker-sbx` does **not** create a
+`~/workspace` symlink to it — pointing one at the host spelling of the path left a dangling link
+inside the sandbox.
 
 ### Examples
 
 Project is in user's directory user's projects/test01 :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01
 ```
 
 Project's files are in /mnt/c/Users/johndoe/projects/test01 (WSL) :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p /mnt/c/Users/johndoe/projects/test01
+python3 docker-sbx-create-sandbox.py -n test01 -p /mnt/c/Users/johndoe/projects/test01
 ```
 
 Project's files are in user's projects/test01 and Anthropic API key is provided in private/.anthropic.api.env :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.anthropic.api.env
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -e $HOME/private/.anthropic.api.env
 ```
 
 Project's files are in user's projects/test01 and AI backend is an Ollama server running on a server :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.ollama.srv.env
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -e $HOME/private/.ollama.srv.env
 ```
 
 Project's files are in user's projects/test01 and AI backend is an Ollama server running on a server, using a custom secrets files settings :
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.ollama.srv.env -sf secrets.json
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -e $HOME/private/.ollama.srv.env -sf secrets.json
 ```
 
 Generate a default secrets files settings json :
 ```
-./docker-sbx-create-sandbox.sh -gsf secrets.json
+python3 docker-sbx-create-sandbox.py -gsf secrets.json
 ```
 
 Use a Python profile to allow access to PyPI:
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -profile python
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile python
 ```
 
 Use multiple profiles (order matters):
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -profile python,node
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile python,node
 ```
 
 Use a custom profile directory:
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -profile myprofile -profile-directory $HOME/my-profiles
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile myprofile -profile-directory $HOME/my-profiles
 ```
 
 Mount an extra directory read-only and another one read-write:
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -v /mnt/c/docs -v /mnt/c/data:rw
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -v /mnt/c/docs -v /mnt/c/data:rw
 ```
 
 .anthropic.api.env :
@@ -199,9 +276,9 @@ Rules:
 Example:
 
 ```bash
-./docker-sbx-create-sandbox.sh -n pyproject -p "$HOME/projects/pyproject" -profile python
-./docker-sbx-create-sandbox.sh -n spring -p "$HOME/projects/spring" -profile java-spring-boot
-./docker-sbx-create-sandbox.sh -n fullstack -p "$HOME/projects/fullstack" -profile python,node
+python3 docker-sbx-create-sandbox.py -n pyproject -p "$HOME/projects/pyproject" -profile python
+python3 docker-sbx-create-sandbox.py -n spring -p "$HOME/projects/spring" -profile java-spring-boot
+python3 docker-sbx-create-sandbox.py -n fullstack -p "$HOME/projects/fullstack" -profile python,node
 ```
 
 
@@ -275,7 +352,7 @@ SBX_SLACK_CHANNEL=C0123456789
 and pass it like any other env file:
 
 ```
-./docker-sbx-create-sandbox.sh -n test01 -p $HOME/projects/test01 -e $HOME/private/.slack.env
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -e $HOME/private/.slack.env
 ```
 
 ### Variables
@@ -377,16 +454,16 @@ Run `sbx exec -ti [sandbox name] bash` if you need to take a look or fix somethi
 
 ## Update sandboxes
 
-`docker-sbx-update-sandboxes.sh` refreshes the OS packages inside existing sandboxes:
+`docker-sbx-update-sandboxes.py` refreshes the OS packages inside existing sandboxes:
 for each one it runs `sudo apt update`, then `sudo apt upgrade -y`, then
 `sudo apt autoremove -y`. With no arguments it processes every sandbox returned by
 `sbx ls`.
 
 ```
-./docker-sbx-update-sandboxes.sh                       # every sandbox
-./docker-sbx-update-sandboxes.sh -i bc,web-1           # only bc and web-1
-./docker-sbx-update-sandboxes.sh -x bc,web-1           # all except bc and web-1
-./docker-sbx-update-sandboxes.sh -i bc,web-1 -x bc     # bc is skipped (exclusions win)
+python3 docker-sbx-update-sandboxes.py                       # every sandbox
+python3 docker-sbx-update-sandboxes.py -i bc,web-1           # only bc and web-1
+python3 docker-sbx-update-sandboxes.py -x bc,web-1           # all except bc and web-1
+python3 docker-sbx-update-sandboxes.py -i bc,web-1 -x bc     # bc is skipped (exclusions win)
 ```
 
 `-i`/`--include` and `-x`/`--exclude` take a comma- or space-separated list and are
@@ -396,7 +473,7 @@ is slow or unreliable.
 The recommended invocation wraps it in `script`, because `sbx` wants a real TTY:
 
 ```
-script -q /dev/null ./docker-sbx-update-sandboxes.sh [OPTIONS]
+script -q /dev/null python3 docker-sbx-update-sandboxes.py [OPTIONS]
 ```
 
 Useful environment variables (all optional):
