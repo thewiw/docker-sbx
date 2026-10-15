@@ -10,14 +10,18 @@ set -euo pipefail
 # script exits non-zero too. Fail loudly rather than quietly skew the results.
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# The host script is being migrated from bash to cross-platform Python, so the
-# CLI-level tests below run against both implementations: one suite, two
-# implementations, which is what catches them drifting apart. Override with
+# The migration from bash to cross-platform Python is done, so the CLI-level tests
+# below run against the Python implementation; the bash host script
+# (docker-sbx-create-sandbox.sh) is no longer in the tree. While both existed the
+# same assertions ran against each, which is what caught them drifting apart - the
+# override is kept for a checkout that still has both:
 #   SBX_IMPLS=python bash test/run-tests.sh
-IMPLS="${SBX_IMPLS:-bash python}"
+IMPLS="${SBX_IMPLS:-python}"
 
 select_impl() {
   case "$1" in
+    # Only reachable with SBX_IMPLS=bash, and only where the retired script is still
+    # present; otherwise the check below fails loudly.
     bash)   SCRIPT="$REPO_DIR/docker-sbx-create-sandbox.sh"; RUNNER=(bash) ;;
     python) SCRIPT="$REPO_DIR/docker-sbx-create-sandbox.py"; RUNNER=(python3) ;;
     *) echo "unknown implementation: $1 (expected bash or python)" >&2; exit 2 ;;
@@ -386,20 +390,19 @@ for impl in $IMPLS; do
 done
 
 # ----------------------------------------------------------------------
-# Implementation-independent tests (13-18): these exercise the in-sandbox
-# scripts (sandbox/*.sh) rather than the host implementation, so they run once.
-# SCRIPT is re-pointed at the bash implementation because TEST 13 extracts shell
-# functions from it; the Python equivalent lives in test/test_create_sandbox.py.
+# Implementation-independent tests (13-19): these exercise the in-sandbox
+# scripts (sandbox/*.sh) rather than a host implementation, so they run once.
+# TEST 13 drives the host's Slack policy code, which is Python now - the bash host
+# script it used to extract shell functions from was retired - so SCRIPT is
+# re-pointed at the module explicitly instead of at whatever the loop selected.
 # ----------------------------------------------------------------------
-select_impl bash
+SCRIPT="$REPO_DIR/docker-sbx-create-sandbox.py"
 SCRIPTS_DIR="$REPO_DIR"
 
 # ----------------------------------------------------------------------
 # TEST 13: host side allows only the endpoints the credential style needs
 # ----------------------------------------------------------------------
 echo "TEST 13: host side allows only the needed Slack endpoints"
-HOST_FNS="$TMPDIR/host-fns.sh"
-sed -n '/^env_file_get() {/,/^trim() {/p' "$SCRIPT" | head -n -1 > "$HOST_FNS"
 STUB_BIN="$TMPDIR/stubbin"
 mkdir -p "$STUB_BIN"
 cat > "$STUB_BIN/sbx" << 'SCRIPT'
@@ -409,8 +412,22 @@ SCRIPT
 chmod +x "$STUB_BIN/sbx"
 
 hosts_for() {
-  PATH="$STUB_BIN:$PATH" bash -c "source '$HOST_FNS'; envfile='$1'; name='probe'; update_sbx_policy_slack" 2>&1 \
+  # Import the host module, point its CONFIG at the case's env file and run
+  # update_sbx_policy_slack() with the stub `sbx` on PATH; read back the hosts it
+  # allowed. (The Python port echoes each command it runs, so the "allowing" lines
+  # are what identify the policy rules actually applied.)
+  PATH="$STUB_BIN:$PATH" python3 - "$SCRIPT" "$1" 2>&1 <<'PY' \
     | grep -o 'allowing .*' | sed 's/allowing //' | paste -sd, - || true
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("create_sbx", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.CONFIG.name = "probe"
+module.CONFIG.envfile = sys.argv[2]
+module.update_sbx_policy_slack()
+PY
 }
 CASE_ENV="$TMPDIR/slack-hosts.env"
 printf 'SBX_SLACK_ENABLED=true\nSBX_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T/B/x\n' > "$CASE_ENV"

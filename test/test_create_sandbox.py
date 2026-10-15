@@ -5,8 +5,7 @@ Covers the pure helpers the CLI relies on: argument parsing, the env-file reader
 volume specs, Slack validation, host extraction, the secrets-file scanner, the
 minimal YAML profile parser, the sandbox-name pre-check and the wait for a new
 sandbox's first start. The end-to-end behaviour is covered separately by
-test/run-tests.sh, which runs the same assertions against the bash and Python
-implementations.
+test/run-tests.sh, which drives this implementation's CLI.
 
     python3 -m unittest discover -s test -p 'test_*.py'
     (or, from inside test/:  python3 -m unittest test_create_sandbox)

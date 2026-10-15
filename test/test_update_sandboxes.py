@@ -10,9 +10,13 @@ detection, and the three sandbox-name extraction paths. Nothing here needs a rea
     (or, from inside test/:  python3 -m unittest test_update_sandboxes)
 """
 
+import contextlib
 import importlib.util
+import io
+import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # The module name has hyphens, so it cannot be imported by name. The script sits
 # in the repository root, one level up from this test/ directory.
@@ -177,6 +181,56 @@ class NameExtractionTests(unittest.TestCase):
     def test_table_skips_unicode_rule_rows(self):
         text = "NAME   ID\n─────  ──\nweb-1  abc\n"
         self.assertEqual(us.parse_table_names(text), ["web-1"])
+
+
+class QueryTimeoutTests(unittest.TestCase):
+    """The query timeout is Python's, not a `timeout(1)` binary.
+
+    Windows ships an unrelated `timeout.exe` under that name - it *waits* N seconds -
+    so a by-name lookup found it, prefixed every query with `timeout 120 sbx ...`,
+    and the script reported "no sandboxes found" on a Windows host.
+    """
+
+    def _captured_argv(self, cfg, args):
+        with mock.patch.object(us.subprocess, "run") as fake_run:
+            fake_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            us.sbx_run(cfg, ["sbx"], args, capture=True)
+        return fake_run.call_args
+
+    def test_a_query_is_just_sbx_with_no_prefix_of_any_kind(self):
+        call = self._captured_argv(us.Config({}), ["ls", "-q"])
+        self.assertEqual(call[0][0], ["sbx", "ls", "-q"])
+
+    def test_the_configured_timeout_goes_to_subprocess(self):
+        call = self._captured_argv(us.Config({"SBX_TIMEOUT": "5"}), ["version"])
+        self.assertEqual(call.kwargs["timeout"], 5.0)
+
+    def test_a_timed_out_query_is_a_failed_run_not_an_exception(self):
+        with mock.patch.object(
+            us.subprocess, "run", side_effect=subprocess.TimeoutExpired("sbx", 120)
+        ):
+            proc = us.run(["sbx", "ls"], timeout=120)
+        self.assertEqual(proc.returncode, 124)  # the status GNU timeout(1) reports
+
+    def test_timeout_seconds_parses_a_plain_number(self):
+        self.assertEqual(us.timeout_seconds("120"), 120.0)
+        self.assertEqual(us.timeout_seconds("2.5"), 2.5)
+
+    def test_a_timeout_that_is_not_a_positive_number_is_rejected(self):
+        for raw in ("soon", "0", "-5", ""):
+            with self.assertRaises(us.UsageError) as caught:
+                us.timeout_seconds(raw)
+            self.assertIn("SBX_TIMEOUT", str(caught.exception))
+
+    def test_a_bad_timeout_exits_2_before_the_first_query(self):
+        err = io.StringIO()
+        with mock.patch.dict(us.os.environ, {"SBX_TIMEOUT": "soon"}), mock.patch.object(
+            us, "sbx_run"
+        ) as query, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = us.main([])
+        self.assertEqual(rc, 2)
+        self.assertIn("SBX_TIMEOUT must be a number of seconds", err.getvalue())
+        query.assert_not_called()
 
 
 if __name__ == "__main__":

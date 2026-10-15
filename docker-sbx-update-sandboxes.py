@@ -32,7 +32,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -48,10 +47,6 @@ def info(msg: str = "") -> None:
 
 def warn(msg: str) -> None:
     print(f"Warning: {msg}", file=sys.stderr)
-
-
-def have(command: str) -> bool:
-    return shutil.which(command) is not None
 
 
 # --------------------------------------------------------------------------
@@ -218,16 +213,19 @@ def build_sbx(cfg: Config):
     return ["sbx", "--cloud"] if cfg.cloud == "1" else ["sbx"]
 
 
-def find_timeout() -> str:
-    """A `timeout` binary name for query calls, or "" when there is none.
+def timeout_seconds(raw: str) -> float:
+    """SBX_TIMEOUT as a number of seconds, for Python's own subprocess timeout.
 
-    macOS has no `timeout`; GNU coreutils ships it as `gtimeout`.
+    The bash script hands the value to `timeout(1)`; here Python measures it, so the
+    value is validated once, up front, instead of reaching a command line per query.
     """
-    for candidate in ("timeout", "gtimeout"):
-        if have(candidate):
-            return candidate
-    warn("no timeout/gtimeout found")
-    return ""
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        raise UsageError(f"SBX_TIMEOUT must be a number of seconds, got '{raw}'")
+    if seconds <= 0:
+        raise UsageError(f"SBX_TIMEOUT must be greater than 0, got '{raw}'")
+    return seconds
 
 
 def detect_exec_flags(explicit: str, stdin_tty: bool, stdout_tty: bool) -> str:
@@ -242,28 +240,41 @@ def detect_exec_flags(explicit: str, stdin_tty: bool, stdout_tty: bool) -> str:
 # --------------------------------------------------------------------------
 
 
-def run(cmd, *, capture: bool = False, stdin=None):
-    """Run a command, capturing stdout only when asked (stderr stays visible)."""
+def run(cmd, *, capture: bool = False, stdin=None, timeout=None):
+    """Run a command, capturing stdout only when asked (stderr stays visible).
+
+    `timeout` is measured by Python, not by a `timeout(1)` binary. Windows ships an
+    unrelated `timeout.exe` under that name - it *waits* N seconds - so looking one
+    up by name found it and prefixed every query with `timeout 120 sbx ...`, which it
+    rejected. Every query then came back failed and the script reported "no
+    sandboxes found". A timeout is reported as exit code 124, the status GNU
+    timeout(1) uses, so callers still handle one shape.
+    """
     # Flush first: our stdout is block-buffered when piped, while the child writes
     # straight to the inherited fd. Without this, "Preflight ..." lands *after* the
     # output of the sbx call it precedes.
     sys.stdout.flush()
     sys.stderr.flush()
+    argv = [str(c) for c in cmd]
     kwargs = {"text": True}
     if capture:
         kwargs["stdout"] = subprocess.PIPE
     if stdin is not None:
         kwargs["stdin"] = stdin
-    return subprocess.run([str(c) for c in cmd], **kwargs)
+    try:
+        return subprocess.run(argv, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout}s")
 
 
-def sbx_run(cfg: Config, sbx, timeout_bin: str, args, *, capture: bool = False):
+def sbx_run(cfg: Config, sbx, args, *, capture: bool = False):
     """Queries: time-limited, non-interactive, stdin closed."""
-    argv = []
-    if timeout_bin:
-        argv += [timeout_bin, str(cfg.sbx_timeout)]
-    argv += [*sbx, *args]
-    return run(argv, capture=capture, stdin=subprocess.DEVNULL)
+    return run(
+        [*sbx, *args],
+        capture=capture,
+        stdin=subprocess.DEVNULL,
+        timeout=timeout_seconds(cfg.sbx_timeout),
+    )
 
 
 def sbx_exec(sbx, exec_flags: str, name: str, cmd: str) -> int:
@@ -348,7 +359,7 @@ def parse_table_names(text: str):
     return sorted(set(names))
 
 
-def list_sandboxes(cfg: Config, sbx, timeout_bin: str):
+def list_sandboxes(cfg: Config, sbx):
     """Sandbox names, from the first of four sources that answers.
 
     Each source is stripped and de-duplicated. The final fallback always yields a
@@ -361,17 +372,17 @@ def list_sandboxes(cfg: Config, sbx, timeout_bin: str):
             return clean_names(proc.stdout)
 
     # Documented "names only" output.
-    proc = sbx_run(cfg, sbx, timeout_bin, ["ls", "-q"], capture=True)
+    proc = sbx_run(cfg, sbx, ["ls", "-q"], capture=True)
     if proc.returncode == 0:
         return clean_names(proc.stdout)
 
     # Fallback: JSON output.
-    proc = sbx_run(cfg, sbx, timeout_bin, ["ls", "--json"], capture=True)
+    proc = sbx_run(cfg, sbx, ["ls", "--json"], capture=True)
     if proc.returncode == 0 and ("{" in proc.stdout or "[" in proc.stdout):
         return sorted(set(extract_json_names(proc.stdout)))
 
     # Last resort: first column of the human-readable table.
-    proc = sbx_run(cfg, sbx, timeout_bin, ["ls"], capture=True)
+    proc = sbx_run(cfg, sbx, ["ls"], capture=True)
     return parse_table_names(proc.stdout)
 
 
@@ -394,14 +405,22 @@ def main(argv=None) -> int:
         usage(sys.stdout)
         return 0
 
+    # Reject a bad SBX_TIMEOUT before the first query: it is an environment problem,
+    # not a command line one, so no usage dump - but it must not be discovered by
+    # watching every query fail one by one.
+    try:
+        timeout_seconds(cfg.sbx_timeout)
+    except UsageError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
     sbx = build_sbx(cfg)
-    timeout_bin = find_timeout()
     exec_flags = detect_exec_flags(cfg.sbx_exec_flags, sys.stdin.isatty(), sys.stdout.isatty())
     apt_chain = build_apt_chain(cfg)
 
     info(f"Preflight (exec flags: {exec_flags}, sudo prefix: '{cfg.sudo}')")
-    sbx_run(cfg, sbx, timeout_bin, ["version"])
-    sbx_run(cfg, sbx, timeout_bin, ["daemon", "status"])
+    sbx_run(cfg, sbx, ["version"])
+    sbx_run(cfg, sbx, ["daemon", "status"])
 
     if cfg.include:
         # Explicit -i list: no sbx ls, no preflight listing.
@@ -409,7 +428,7 @@ def main(argv=None) -> int:
         info(f"Including {len(sandboxes)} sandbox(es): " + " ".join(sandboxes))
     else:
         # No -i: list everything.
-        sandboxes = list_sandboxes(cfg, sbx, timeout_bin)
+        sandboxes = list_sandboxes(cfg, sbx)
         if not sandboxes:
             print("no sandboxes found", file=sys.stderr)
             return 0

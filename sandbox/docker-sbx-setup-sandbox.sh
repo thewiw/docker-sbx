@@ -47,7 +47,7 @@ set_env_if_missing() {
 
 load_env_file() {
     # Source the env file passed in from the host (copied into the sandbox by
-    # docker-sbx-create-sandbox.sh) so its variables are available to
+    # docker-sbx-create-sandbox.py) so its variables are available to
     # update_claude_code_settings regardless of whether `sbx exec --env-file`
     # propagated them. Only KEY=VALUE assignments are honoured; blank lines and
     # lines starting with '#' are skipped (matching docker --env-file semantics,
@@ -233,7 +233,7 @@ install_slack_hook() {
   local hooks_dir="$HOME/.claude/hooks"
   mkdir -p "$hooks_dir"
 
-  # The hook script is staged next to this script by docker-sbx-create-sandbox.sh.
+  # The hook script is staged next to this script by docker-sbx-create-sandbox.py.
   local stage="$HOME/slack-notify.sh"
   if [[ ! -f "$stage" ]]; then
     echo "Warning: $stage not found, skipping Slack hook"

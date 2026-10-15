@@ -482,7 +482,7 @@ Useful environment variables (all optional):
 |---|---|---|
 | `DRY_RUN=1` | `0` | Print the command that would run for each sandbox; change nothing. |
 | `CLOUD=1` | `0` | Target cloud sandboxes (adds the global `--cloud` option). |
-| `SBX_TIMEOUT` | `120` | Seconds allowed per query call (`sbx ls`, `version`, `daemon status`). |
+| `SBX_TIMEOUT` | `120` | Seconds allowed per query call (`sbx ls`, `version`, `daemon status`). The script enforces it itself; a value that is not a positive number stops the run. |
 | `SBX_EXEC_FLAGS` | auto | Force the `sbx exec` flags instead of auto-detecting (`-ti` on a TTY, else `-i`). |
 | `SBX_LS_CMD` | – | Custom listing command; sandbox names on stdout. |
 | `APT_CHAIN` | – | Override the in-sandbox command chain. |
