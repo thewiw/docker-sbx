@@ -11,7 +11,9 @@ Tested on :
 
   - Ubuntu 26.04 LTS
 
-All scripts must be in same directory, and must be run from that directory
+Host scripts (install / create / update / test) live in the repository root and must be run
+from that directory. Scripts that run **inside** a sandbox live in `sandbox/`; they are staged
+in automatically by `docker-sbx-create-sandbox.sh` and are not run on the host.
 
 
 ## Install engine

@@ -10,14 +10,14 @@ Tested on WSL Ubuntu 24.04/26.04 LTS and native Ubuntu 26.04 LTS.
 
 ## Scripts
 
-All scripts must remain in the same directory and are run from that directory.
+Scripts that run on the **host** live in the repository root and are run from there. Scripts that run **inside** the sandbox live in `sandbox/` and are staged into the sandbox by `docker-sbx-create-sandbox.sh`; they are never run on the host.
 
 | Script / Directory | Purpose |
 |--------|---------|
 | `docker-sbx-install.sh` | One-time host setup. Installs Docker CE and the `docker-sbx` engine, creates a `kvm` group user, and sets default network policies (deny-all, allow only Ubuntu archives and Docker download). Must be run with `sudo`. |
-| `docker-sbx-create-sandbox.sh` | Creates a new sandbox for a project. Scans the project for secrets (file patterns + gitleaks), runs `sbx create`, then copies `docker-sbx-setup-sandbox.sh` into the sandbox and executes it. Optionally applies per-sandbox policy profiles. |
-| `docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox. Stops any running `apt` processes, updates packages, installs `jq`, writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`, and symlinks `~/workspace` to the project path on the host. Also installs the optional Slack notification hook when the env file asks for it. |
-| `docker-sbx-slack-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/slack-notify.sh`. Invoked by Claude Code as a hook with the event payload on stdin; posts one short line per lifecycle event to Slack. Only installed when the optional feature is enabled via the env file. |
+| `docker-sbx-create-sandbox.sh` | Creates a new sandbox for a project. Scans the project for secrets (file patterns + gitleaks), runs `sbx create`, then copies `sandbox/docker-sbx-setup-sandbox.sh` into the sandbox and executes it. Optionally applies per-sandbox policy profiles. |
+| `sandbox/docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox. Stops any running `apt` processes, updates packages, installs `jq`, writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`, and symlinks `~/workspace` to the project path on the host. Also installs the optional Slack notification hook when the env file asks for it. |
+| `sandbox/docker-sbx-slack-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/slack-notify.sh`. Invoked by Claude Code as a hook with the event payload on stdin; posts one short line per lifecycle event to Slack. Only installed when the optional feature is enabled via the env file. |
 | `docker-sbx-update-sandboxes.sh` | Maintenance helper. Runs `apt update/upgrade/autoremove` inside existing sandboxes via `sbx exec`, one at a time. Enumerates with `sbx ls` (or a custom `SBX_LS_CMD`), selectable with `-i`/`-x`; `DRY_RUN=1` prints instead of running. Not part of sandbox creation. |
 | `run-tests.sh` | Test suite for the Slack notification feature and the env-file contract. Exercises the hook, the settings merge, failure logging, and a real POST to a loopback sink. Run directly on the host; no sandbox required. |
 | `profiles/` | YAML policy profiles used by `docker-sbx-create-sandbox.sh` to grant a sandbox access to language-specific external resources. |
@@ -163,7 +163,7 @@ Things to keep in mind when editing this feature:
 
 ## Claude Code Settings Written by Setup
 
-`docker-sbx-setup-sandbox.sh` writes the following to `~/.claude/settings.json` inside the sandbox:
+`sandbox/docker-sbx-setup-sandbox.sh` writes the following to `~/.claude/settings.json` inside the sandbox:
 
 - `DISABLE_TELEMETRY=1`
 - `CLAUDE_CODE_ENABLE_TELEMETRY=0`

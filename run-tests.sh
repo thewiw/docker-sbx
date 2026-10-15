@@ -1,7 +1,19 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT="/home/regis_wernet/projects/docker-sbx/docker-sbx-create-sandbox.sh"
+# Locate the scripts relative to this file so the suite runs from any checkout.
+# The previous hard-coded absolute path made every test that invokes "$SCRIPT"
+# fail anywhere but the author's machine - and, worse, the two tests that
+# *expect* a non-zero exit (missing -sf file, -gsf to a bad directory) passed
+# for the wrong reason, since a missing script exits non-zero too. Fail loudly
+# rather than quietly skew the results.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="$SCRIPT_DIR/docker-sbx-create-sandbox.sh"
+if [[ ! -f "$SCRIPT" ]]; then
+  echo "Error: $SCRIPT not found - run this suite from the repository containing the scripts" >&2
+  exit 1
+fi
+
 TMPDIR="/tmp/docker-sbx-tests-$$"
 PASSED=0
 FAILED=0
@@ -382,13 +394,13 @@ fi
 echo "TEST 14: in-sandbox installer writes the config and stays idempotent"
 INSTALLER_FNS="$TMPDIR/installer-fns.sh"
 # Starts at load_env_file so the env-file parsing is exercised too (TEST 17).
-sed -n '/^load_env_file() {/,/^update_claude_code_settings() {/p' "$SCRIPTS_DIR/docker-sbx-setup-sandbox.sh" | head -n -1 > "$INSTALLER_FNS"
+sed -n '/^load_env_file() {/,/^update_claude_code_settings() {/p' "$SCRIPTS_DIR/sandbox/docker-sbx-setup-sandbox.sh" | head -n -1 > "$INSTALLER_FNS"
 FAKEHOME="$TMPDIR/fakehome"
 mkdir -p "$FAKEHOME/.claude"
 printf '{"model":"keepme"}\n' > "$FAKEHOME/.claude/settings.json"
 
 run_installer() {
-  cp "$SCRIPTS_DIR/docker-sbx-slack-notify.sh" "$FAKEHOME/slack-notify.sh"
+  cp "$SCRIPTS_DIR/sandbox/docker-sbx-slack-notify.sh" "$FAKEHOME/slack-notify.sh"
   HOME="$FAKEHOME" SANDBOX_NAME=canopy-420 SBX_SLACK_ENABLED=true \
     SBX_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/T/B/x' \
     bash -c "source '$INSTALLER_FNS'; prjpath=/mnt/c/Projects/canopy; install_slack_hook" >/dev/null 2>&1 || true
@@ -445,7 +457,7 @@ fi
 echo "TEST 16: hook script posts the expected payload to an endpoint"
 HOOKDIR="$TMPDIR/hook"
 mkdir -p "$HOOKDIR"
-cp "$SCRIPTS_DIR/docker-sbx-slack-notify.sh" "$HOOKDIR/slack-notify.sh"
+cp "$SCRIPTS_DIR/sandbox/docker-sbx-slack-notify.sh" "$HOOKDIR/slack-notify.sh"
 chmod 755 "$HOOKDIR/slack-notify.sh"
 SINKLOG="$TMPDIR/sink.jsonl"
 : > "$SINKLOG"
@@ -506,7 +518,7 @@ printf '{"model":"keepme"}\n' > "$CRLF_HOME/.claude/settings.json"
 # line with none. The host side trims the CR, so before the fix the host reported
 # the feature as enabled while the sandbox installed nothing at all.
 printf 'SBX_SLACK_ENABLED=true\r\nSBX_SLACK_BOT_TOKEN=xoxb-t\r\nSBX_SLACK_CHANNEL=C0123456789\r\nSBX_SLACK_EVENTS=Stop,Notification,SessionStart,SessionEnd\n' > "$TMPDIR/crlf.env"
-CRLF_OUT="$(cp "$SCRIPTS_DIR/docker-sbx-slack-notify.sh" "$CRLF_HOME/slack-notify.sh" &&
+CRLF_OUT="$(cp "$SCRIPTS_DIR/sandbox/docker-sbx-slack-notify.sh" "$CRLF_HOME/slack-notify.sh" &&
   HOME="$CRLF_HOME" bash -c "source '$INSTALLER_FNS'; envfilepath='$TMPDIR/crlf.env'; load_env_file; prjpath=/mnt/c/Projects/canopy; install_slack_hook" 2>&1 || true)"
 if echo "$CRLF_OUT" | grep -q "Slack notifications enabled"; then
   pass "A CRLF env file still installs the hook"
@@ -539,7 +551,7 @@ fi
 echo "TEST 18: failed posts are recorded, successes are not"
 HOOKLOG_HOME="$TMPDIR/hooklog"
 mkdir -p "$HOOKLOG_HOME"
-cp "$SCRIPTS_DIR/docker-sbx-slack-notify.sh" "$HOOKLOG_HOME/slack-notify.sh"
+cp "$SCRIPTS_DIR/sandbox/docker-sbx-slack-notify.sh" "$HOOKLOG_HOME/slack-notify.sh"
 chmod 755 "$HOOKLOG_HOME/slack-notify.sh"
 STUB_BIN2="$TMPDIR/stubbin2"
 mkdir -p "$STUB_BIN2"

@@ -246,13 +246,13 @@ setup_sandbox() {
   echo "════════════════"
   echo ""
 
-  sbx cp ./docker-sbx-setup-sandbox.sh "$name":"$sbx_home/setup-sandbox.sh"
+  sbx cp "$(dirname "$0")/sandbox/docker-sbx-setup-sandbox.sh" "$name":"$sbx_home/setup-sandbox.sh"
   sbx exec -ti "$name" sudo chmod 755 "$sbx_home/setup-sandbox.sh"
 
   # The Slack hook script is staged only when the feature is switched on, so a
   # sandbox without it keeps exactly the previous behaviour.
   if slack_enabled; then
-    sbx cp ./docker-sbx-slack-notify.sh "$name":"$sbx_home/slack-notify.sh"
+    sbx cp "$(dirname "$0")/sandbox/docker-sbx-slack-notify.sh" "$name":"$sbx_home/slack-notify.sh"
     sbx exec -ti "$name" sudo chmod 755 "$sbx_home/slack-notify.sh"
   fi
 
