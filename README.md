@@ -53,6 +53,12 @@ For maximum security, the shared volume should only contain project files (sourc
 
 For the same reason, sources history (git) MUST NOT contain credentials/certificates/... either (or worst-case scenario if those data exist then they must be obsolete).
 
+The cross-platform Python version (Linux, WSL, macOS, Windows) takes exactly the same options:
+
+    python3 docker-sbx-create-sandbox.py -n test01 -p /absolute/project/path
+
+Add `--dry-run` to print every command without creating anything. `./docker-sbx-create-sandbox.sh` is kept while the Python port is validated.
+
 ```
 ./docker-sbx-create-sandbox.sh -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -v {path} -profile {comma-separated profile names} -profile-directory {path to profile directory} :
   -n                  : name of the sandbox [[mandatory]]

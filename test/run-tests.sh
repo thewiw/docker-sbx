@@ -2,17 +2,36 @@
 set -euo pipefail
 
 # Locate the scripts relative to this file so the suite runs from any checkout.
-# The previous hard-coded absolute path made every test that invokes "$SCRIPT"
-# fail anywhere but the author's machine - and, worse, the two tests that
-# *expect* a non-zero exit (missing -sf file, -gsf to a bad directory) passed
-# for the wrong reason, since a missing script exits non-zero too. Fail loudly
-# rather than quietly skew the results.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="$SCRIPT_DIR/docker-sbx-create-sandbox.sh"
-if [[ ! -f "$SCRIPT" ]]; then
-  echo "Error: $SCRIPT not found - run this suite from the repository containing the scripts" >&2
-  exit 1
-fi
+# The suite lives in test/, so the repository root - where the host scripts and
+# sandbox/ are - is one level up. Earlier this was a hard-coded absolute path,
+# which made every test that invokes "$SCRIPT" fail anywhere but the author's
+# machine - and, worse, the two tests that *expect* a non-zero exit (missing -sf
+# file, -gsf to a bad directory) passed for the wrong reason, since a missing
+# script exits non-zero too. Fail loudly rather than quietly skew the results.
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The host script is being migrated from bash to cross-platform Python, so the
+# CLI-level tests below run against both implementations: one suite, two
+# implementations, which is what catches them drifting apart. Override with
+#   SBX_IMPLS=python bash test/run-tests.sh
+IMPLS="${SBX_IMPLS:-bash python}"
+
+select_impl() {
+  case "$1" in
+    bash)   SCRIPT="$REPO_DIR/docker-sbx-create-sandbox.sh"; RUNNER=(bash) ;;
+    python) SCRIPT="$REPO_DIR/docker-sbx-create-sandbox.py"; RUNNER=(python3) ;;
+    *) echo "unknown implementation: $1 (expected bash or python)" >&2; exit 2 ;;
+  esac
+  IMPL="$1"
+  if [[ ! -f "$SCRIPT" ]]; then
+    echo "Error: $SCRIPT not found - is this suite still inside the repository?" >&2
+    exit 1
+  fi
+}
+
+# Invoke the implementation under test. RUNNER is an array so `bash file.sh` and
+# `python3 file.py` are handled uniformly.
+run_create() { "${RUNNER[@]}" "$SCRIPT" "$@"; }
 
 TMPDIR="/tmp/docker-sbx-tests-$$"
 PASSED=0
@@ -35,11 +54,17 @@ trap cleanup EXIT
 mkdir -p "$TMPDIR"
 
 # ----------------------------------------------------------------------
+# CLI-level tests (1-12): every one of these drives the implementation under
+# test through its command line, so they are run once per implementation.
+# ----------------------------------------------------------------------
+cli_tests() {
+
+# ----------------------------------------------------------------------
 # TEST 1: -gsf generates a valid JSON secrets config file
 # ----------------------------------------------------------------------
 echo "TEST 1: -gsf generates a valid JSON secrets config file"
 OUTFILE="$TMPDIR/generated.json"
-if bash "$SCRIPT" -gsf "$OUTFILE" >/dev/null 2>&1; then
+if run_create -gsf "$OUTFILE" >/dev/null 2>&1; then
   if [[ -f "$OUTFILE" ]]; then
     if python3 -c "import json; d=json.load(open('$OUTFILE')); assert 'search' in d and 'avoid' in d" 2>/dev/null; then
       pass "File generated and contains required keys"
@@ -183,7 +208,7 @@ fi
 # TEST 4: -sf with missing file exits with error before sandbox creation
 # ----------------------------------------------------------------------
 echo "TEST 4: -sf with missing file exits with error before sandbox creation"
-if bash "$SCRIPT" -sf "$TMPDIR/nonexistent.json" -n test -p /tmp 2>/dev/null; then
+if run_create -sf "$TMPDIR/nonexistent.json" -n test -p /tmp 2>/dev/null; then
   fail "Should have exited with error for missing -sf file"
 else
   pass "Exited with error for missing -sf file"
@@ -259,7 +284,7 @@ fi
 # TEST 6: Help flag (-h) shows usage and exits
 # ----------------------------------------------------------------------
 echo "TEST 6: Help flag (-h) shows usage and exits"
-OUTPUT=$(bash "$SCRIPT" -h 2>&1 || true)
+OUTPUT=$(run_create -h 2>&1 || true)
 if echo "$OUTPUT" | grep -q "Usage:" && echo "$OUTPUT" | grep -q "\-sf"; then
   pass "Help output contains usage and -sf option"
 else
@@ -270,7 +295,7 @@ fi
 # TEST 7: Unknown option shows error and usage
 # ----------------------------------------------------------------------
 echo "TEST 7: Unknown option shows error and usage"
-OUTPUT=$(bash "$SCRIPT" --unknown 2>&1 || true)
+OUTPUT=$(run_create --unknown 2>&1 || true)
 if echo "$OUTPUT" | grep -q "Unknown option" && echo "$OUTPUT" | grep -q "Usage:"; then
   pass "Unknown option handled correctly"
 else
@@ -281,7 +306,7 @@ fi
 # TEST 8: Missing mandatory params shows error
 # ----------------------------------------------------------------------
 echo "TEST 8: Missing mandatory params shows error"
-OUTPUT=$(bash "$SCRIPT" 2>&1 || true)
+OUTPUT=$(run_create 2>&1 || true)
 if echo "$OUTPUT" | grep -q "Missing parameter"; then
   pass "Missing params error shown"
 else
@@ -292,7 +317,7 @@ fi
 # TEST 9: -gsf to nonexistent directory fails
 # ----------------------------------------------------------------------
 echo "TEST 9: -gsf to nonexistent directory fails"
-if bash "$SCRIPT" -gsf "$TMPDIR/no/dir/file.json" 2>/dev/null; then
+if run_create -gsf "$TMPDIR/no/dir/file.json" 2>/dev/null; then
   fail "Should have failed for nonexistent directory"
 else
   pass "Correctly failed for nonexistent directory"
@@ -303,7 +328,7 @@ fi
 # ----------------------------------------------------------------------
 echo "TEST 10: Generated JSON contains expected default patterns"
 GENFILE="$TMPDIR/gen-verify.json"
-bash "$SCRIPT" -gsf "$GENFILE" >/dev/null 2>&1
+run_create -gsf "$GENFILE" >/dev/null 2>&1 || true
 if python3 -c "
 import json
 d = json.load(open('$GENFILE'))
@@ -325,13 +350,13 @@ echo "TEST 11: Slack enabled without a usable target aborts creation"
 SCRIPTS_DIR="$(dirname "$SCRIPT")"
 SLACK_ENV="$TMPDIR/slack-no-target.env"
 printf 'SBX_SLACK_ENABLED=true\n' > "$SLACK_ENV"
-OUTPUT=$(bash "$SCRIPT" -n test -p /tmp -s false -e "$SLACK_ENV" 2>&1 || true)
+OUTPUT=$(run_create -n test -p /tmp -s false -e "$SLACK_ENV" 2>&1 || true)
 if echo "$OUTPUT" | grep -q "no usable Slack target"; then
   pass "Aborts with a clear message when no target is configured"
 else
   fail "Did not report the missing Slack target"
 fi
-if bash "$SCRIPT" -n test -p /tmp -s false -e "$SLACK_ENV" >/dev/null 2>&1; then
+if run_create -n test -p /tmp -s false -e "$SLACK_ENV" >/dev/null 2>&1; then
   fail "Should have exited non-zero for a missing Slack target"
 else
   pass "Exits non-zero before creating anything"
@@ -343,12 +368,31 @@ fi
 echo "TEST 12: unsupported SBX_SLACK_EVENTS entry aborts creation"
 BAD_EVENT_ENV="$TMPDIR/slack-bad-event.env"
 printf 'SBX_SLACK_ENABLED=true\nSBX_SLACK_WEBHOOK_URL=https://hooks.slack.com/x\nSBX_SLACK_EVENTS=Stop,Bogus\n' > "$BAD_EVENT_ENV"
-OUTPUT=$(bash "$SCRIPT" -n test -p /tmp -s false -e "$BAD_EVENT_ENV" 2>&1 || true)
+OUTPUT=$(run_create -n test -p /tmp -s false -e "$BAD_EVENT_ENV" 2>&1 || true)
 if echo "$OUTPUT" | grep -q "unsupported SBX_SLACK_EVENTS entry 'Bogus'"; then
   pass "Rejects an unknown event name"
 else
   fail "Did not reject the unknown event name"
 fi
+}
+
+for impl in $IMPLS; do
+  select_impl "$impl"
+  echo ""
+  echo "═══════════════════════════════════════════════════════"
+  echo "Implementation under test: $IMPL"
+  echo "═══════════════════════════════════════════════════════"
+  cli_tests
+done
+
+# ----------------------------------------------------------------------
+# Implementation-independent tests (13-18): these exercise the in-sandbox
+# scripts (sandbox/*.sh) rather than the host implementation, so they run once.
+# SCRIPT is re-pointed at the bash implementation because TEST 13 extracts shell
+# functions from it; the Python equivalent lives in test/test_create_sandbox.py.
+# ----------------------------------------------------------------------
+select_impl bash
+SCRIPTS_DIR="$REPO_DIR"
 
 # ----------------------------------------------------------------------
 # TEST 13: host side allows only the endpoints the credential style needs

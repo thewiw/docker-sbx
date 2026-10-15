@@ -6,8 +6,8 @@ prompt parsing, platform/locale selection, profile-path resolution and the
 idempotency of the environment block. Everything that shells out is exercised
 by `--dry-run` instead.
 
-    python3 -m unittest test_docker_sbx_install
-    python3 -m unittest discover -p 'test_*.py'
+    python3 -m unittest discover -s test -p 'test_*.py'
+    (or, from inside test/:  python3 -m unittest test_docker_sbx_install)
 """
 
 import contextlib
@@ -19,9 +19,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-# The module name has hyphens, so it cannot be imported by name.
+# The module name has hyphens, so it cannot be imported by name. The installer
+# sits in the repository root, one level up from this test/ directory.
 _SPEC = importlib.util.spec_from_file_location(
-    "docker_sbx_install", Path(__file__).resolve().parent / "docker-sbx-install.py"
+    "docker_sbx_install",
+    Path(__file__).resolve().parent.parent / "docker-sbx-install.py",
 )
 install = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(install)
