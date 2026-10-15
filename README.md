@@ -22,7 +22,18 @@ This must be done only once.
 
 First [create a docker account](https://app.docker.com/signup/) if you do not have one already or if you want one for this installation.
 
-Run `./docker-sbx-install.sh` and answer the questions (at one point you will need your docker account).
+The cross-platform installer (Linux, WSL, macOS, Windows) needs Python 3.9+:
+
+    sudo python3 docker-sbx-install.py     # Linux / WSL
+    python3 docker-sbx-install.py          # macOS
+    python  docker-sbx-install.py          # Windows, from an elevated terminal
+
+Add `--dry-run` to print every command without changing anything. The script installs or
+updates Docker, installs the `sbx` CLI, signs you in (at one point you will need your docker
+account), sets the global network policy, and persists the environment variables.
+
+The Linux-only bash version, `./docker-sbx-install.sh`, is kept while the Python port is
+validated; it does the same thing, without macOS/Windows support.
 
 At the end of installation, all network communication from the sandboxes is prohibited, except for system updates
 

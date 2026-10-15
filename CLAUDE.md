@@ -4,22 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository contains bash scripts that install the [Docker Sandboxes](https://docs.docker.com/reference/cli/sbx/) engine and automate creation of AI agent sandboxes using Claude Code. Each sandbox is an isolated Docker container with a shared project volume and a restrictive network policy.
+This repository contains scripts that install the [Docker Sandboxes](https://docs.docker.com/reference/cli/sbx/) engine and automate creation of AI agent sandboxes using Claude Code. Each sandbox is an isolated Docker container with a shared project volume and a restrictive network policy.
 
-Tested on WSL Ubuntu 24.04/26.04 LTS and native Ubuntu 26.04 LTS.
+The bash scripts are tested on WSL Ubuntu 24.04/26.04 LTS and native Ubuntu 26.04 LTS. The host scripts are being migrated to cross-platform Python (Linux/WSL, macOS, Windows).
 
 ## Scripts
 
-Scripts that run on the **host** live in the repository root and are run from there. Scripts that run **inside** the sandbox live in `sandbox/` and are staged into the sandbox by `docker-sbx-create-sandbox.sh`; they are never run on the host.
+Scripts that run on the **host** live in the repository root and are run from there. Scripts that run **inside** the sandbox live in `sandbox/` and are staged into the sandbox by `docker-sbx-create-sandbox.sh`; they are never run on the host. Host scripts are being migrated from bash to cross-platform Python (`*.py`, Python 3.9+, standard library only); the `.sh` files are kept until the ports are validated.
 
 | Script / Directory | Purpose |
 |--------|---------|
 | `docker-sbx-install.sh` | One-time host setup. Installs Docker CE and the `docker-sbx` engine, creates a `kvm` group user, and sets default network policies (deny-all, allow only Ubuntu archives and Docker download). Must be run with `sudo`. |
+| `docker-sbx-install.py` | Cross-platform replacement for `docker-sbx-install.sh`, runnable on Linux/WSL, macOS and Windows (Python 3.9+, standard library only). Does the same setup: installs or updates Docker, installs the `sbx` CLI, signs in, sets the global network policy, and persists the environment variables. `--dry-run` prints every command and changes nothing. Needs `sudo` on Linux and an elevated terminal on Windows; Homebrew refuses to run as root on macOS. |
 | `docker-sbx-create-sandbox.sh` | Creates a new sandbox for a project. Scans the project for secrets (file patterns + gitleaks), runs `sbx create`, then copies `sandbox/docker-sbx-setup-sandbox.sh` into the sandbox and executes it. Optionally applies per-sandbox policy profiles. |
 | `sandbox/docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox. Stops any running `apt` processes, updates packages, installs `jq`, writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`, and symlinks `~/workspace` to the project path on the host. Also installs the optional Slack notification hook when the env file asks for it. |
 | `sandbox/docker-sbx-slack-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/slack-notify.sh`. Invoked by Claude Code as a hook with the event payload on stdin; posts one short line per lifecycle event to Slack. Only installed when the optional feature is enabled via the env file. |
 | `docker-sbx-update-sandboxes.sh` | Maintenance helper. Runs `apt update/upgrade/autoremove` inside existing sandboxes via `sbx exec`, one at a time. Enumerates with `sbx ls` (or a custom `SBX_LS_CMD`), selectable with `-i`/`-x`; `DRY_RUN=1` prints instead of running. Not part of sandbox creation. |
 | `run-tests.sh` | Test suite for the Slack notification feature and the env-file contract. Exercises the hook, the settings merge, failure logging, and a real POST to a loopback sink. Run directly on the host; no sandbox required. |
+| `test_docker_sbx_install.py` | Unit tests for the pure helpers in `docker-sbx-install.py` (prompt parsing, platform/locale selection, profile path, environment-block idempotency). Run with `python3 -m unittest test_docker_sbx_install`. |
 | `profiles/` | YAML policy profiles used by `docker-sbx-create-sandbox.sh` to grant a sandbox access to language-specific external resources. |
 
 ## Security Model
