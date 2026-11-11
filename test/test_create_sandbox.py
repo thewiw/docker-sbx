@@ -2,9 +2,10 @@
 """Unit tests for docker-sbx-create-sandbox.py (standard library only).
 
 Covers the pure helpers the CLI relies on: argument parsing, the env-file reader,
-volume specs, Slack validation, host extraction, the secrets-file scanner, the
-minimal YAML profile parser, the sandbox-name pre-check and the wait for a new
-sandbox's first start. The end-to-end behaviour is covered separately by
+volume specs, Slack and Nextcloud Talk validation, provider-script staging, host
+extraction, the secrets-file scanner, the minimal YAML profile parser, the
+sandbox-name pre-check and the wait for a new sandbox's first start. The
+end-to-end behaviour is covered separately by
 test/run-tests.sh, which drives this implementation's CLI.
 
     python3 -m unittest discover -s test -p 'test_*.py'
@@ -133,6 +134,16 @@ class EnvFileTests(unittest.TestCase):
         self.envfile.write_text("X=1\n")
         self.assertEqual(cs.slack_events(), cs.DEFAULT_SLACK_EVENTS)
 
+    def test_nctalk_enabled_is_exact(self):
+        self.envfile.write_text("SBX_NCTALK_ENABLED=true\n")
+        self.assertTrue(cs.nctalk_enabled())
+        self.envfile.write_text("SBX_NCTALK_ENABLED=True\n")
+        self.assertFalse(cs.nctalk_enabled())
+
+    def test_nctalk_events_default(self):
+        self.envfile.write_text("X=1\n")
+        self.assertEqual(cs.nctalk_events(), cs.DEFAULT_NCTALK_EVENTS)
+
 
 class VolumeSpecTests(unittest.TestCase):
     def test_modes(self):
@@ -209,6 +220,101 @@ class SlackValidationTests(unittest.TestCase):
             "SBX_SLACK_ENABLED=true\nSBX_SLACK_WEBHOOK_URL=https://hooks.slack.com/x\n"
             "SBX_SLACK_EVENTS=" + ",".join(cs.SUPPORTED_SLACK_EVENTS) + "\n"
         )
+
+
+class NCTalkValidationTests(unittest.TestCase):
+    """Nextcloud Talk is the Slack feature's second provider, switched on by
+    SBX_NCTALK_ENABLED; its target is a full URL/user/app-password/room set."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.envfile = Path(self._tmp.name) / "sbx.env"
+        cs.CONFIG.envfile = str(self.envfile)
+        cs.CONFIG.name = "probe"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        cs.CONFIG.envfile = ""
+        cs.CONFIG.name = ""
+
+    COMPLETE = {
+        "SBX_NCTALK_URL": "https://cloud.example.com",
+        "SBX_NCTALK_USER": "agent",
+        "SBX_NCTALK_TOKEN": "app-pw",
+        "SBX_NCTALK_ROOM": "abc123",
+    }
+
+    def _run(self, body):
+        self.envfile.write_text(body)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cs.validate_nctalk_config()
+
+    def test_disabled_is_a_no_op(self):
+        self._run("SBX_NCTALK_ENABLED=false\n")
+
+    def test_complete_target_is_accepted(self):
+        self._run("SBX_NCTALK_ENABLED=true\n" + "".join(f"{k}={v}\n" for k, v in self.COMPLETE.items()))
+
+    def test_http_url_with_a_port_is_accepted(self):
+        target = dict(self.COMPLETE, SBX_NCTALK_URL="http://host.docker.internal:8080")
+        self._run("SBX_NCTALK_ENABLED=true\n" + "".join(f"{k}={v}\n" for k, v in target.items()))
+
+    def test_url_requires_an_http_scheme_and_a_valid_host(self):
+        for url in (
+            "cloud.example.com",
+            "ftp://cloud.example.com",
+            "https:///missing-host",
+            "https://cloud.example.com:not-a-port",
+            "https://cloud.example.com/a path",
+        ):
+            with self.subTest(url=url):
+                body = "SBX_NCTALK_ENABLED=true\n" + "".join(
+                    f"{k}={url if k == 'SBX_NCTALK_URL' else v}\n"
+                    for k, v in self.COMPLETE.items()
+                )
+                self.envfile.write_text(body)
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                    err
+                ), self.assertRaises(SystemExit):
+                    cs.validate_nctalk_config()
+                self.assertIn("SBX_NCTALK_URL must be an absolute http:// or https:// URL", err.getvalue())
+
+    def test_each_missing_field_aborts(self):
+        for dropped in self.COMPLETE:
+            with self.subTest(missing=dropped):
+                body = "SBX_NCTALK_ENABLED=true\n" + "".join(
+                    f"{k}={v}\n" for k, v in self.COMPLETE.items() if k != dropped
+                )
+                with self.assertRaises(SystemExit):
+                    self._run(body)
+
+    def test_the_error_names_the_missing_variable(self):
+        err = io.StringIO()
+        body = "SBX_NCTALK_ENABLED=true\nSBX_NCTALK_URL=https://cloud.example.com\n"
+        self.envfile.write_text(body)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            err
+        ), self.assertRaises(SystemExit):
+            cs.validate_nctalk_config()
+        self.assertIn("SBX_NCTALK_USER", err.getvalue())
+
+    def test_unknown_event_aborts(self):
+        body = (
+            "SBX_NCTALK_ENABLED=true\n"
+            + "".join(f"{k}={v}\n" for k, v in self.COMPLETE.items())
+            + "SBX_NCTALK_EVENTS=Stop,Bogus\n"
+        )
+        with self.assertRaises(SystemExit):
+            self._run(body)
+
+    def test_all_supported_events_accepted(self):
+        body = (
+            "SBX_NCTALK_ENABLED=true\n"
+            + "".join(f"{k}={v}\n" for k, v in self.COMPLETE.items())
+            + "SBX_NCTALK_EVENTS=" + ",".join(cs.SUPPORTED_NCTALK_EVENTS) + "\n"
+        )
+        self._run(body)
 
 
 class SecretsConfigTests(unittest.TestCase):
@@ -421,6 +527,48 @@ class CreateSandboxTests(unittest.TestCase):
         self.assertIn("sbx rm d", err.getvalue())
 
 
+class NCTalkStagingTests(unittest.TestCase):
+    """The provider scripts are staged independently, so a sandbox can run Slack
+    only, Talk only, or both."""
+
+    SLACK = "SBX_SLACK_ENABLED=true\nSBX_SLACK_WEBHOOK_URL=https://hooks.slack.com/x\n"
+    TALK = (
+        "SBX_NCTALK_ENABLED=true\nSBX_NCTALK_URL=https://cloud.example.com\n"
+        "SBX_NCTALK_USER=a\nSBX_NCTALK_TOKEN=t\nSBX_NCTALK_ROOM=r\n"
+    )
+
+    def setUp(self):
+        self._config = cs.CONFIG
+        self._dry = cs.DRY_RUN
+        cs.DRY_RUN = False
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.CONFIG = self._config
+        cs.DRY_RUN = self._dry
+
+    def _stage(self, body):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = Path(tmp.name) / "sbx.env"
+        env.write_text(body)
+        cs.CONFIG = cs.parse_args(["-n", "d", "-p", tmp.name, "-e", str(env)])
+        with mock.patch.object(cs, "sbx") as fake_sbx, mock.patch.object(
+            cs, "wait_for_sandbox", return_value=True
+        ), contextlib.redirect_stdout(io.StringIO()):
+            cs.setup_sandbox()
+        return " ".join(" ".join(call[0][0]) for call in fake_sbx.call_args_list)
+
+    def test_talk_script_is_staged_only_when_enabled(self):
+        self.assertIn("nctalk-notify.sh", self._stage(self.TALK))
+        self.assertNotIn("nctalk-notify.sh", self._stage("SBX_NCTALK_ENABLED=false\n"))
+
+    def test_both_providers_can_be_staged_together(self):
+        calls = self._stage(self.SLACK + self.TALK)
+        self.assertIn("slack-notify.sh", calls)
+        self.assertIn("nctalk-notify.sh", calls)
+
+
 class SandboxReadinessTests(unittest.TestCase):
     """Setup must not configure a sandbox whose first start is still running.
 
@@ -485,10 +633,23 @@ class SandboxReadinessTests(unittest.TestCase):
                 cs.setup_sandbox()
             return [call[0][0] for call in fake_sbx.call_args_list], tmp
 
-    def test_the_sandbox_is_started_before_anything_runs_inside_it(self):
-        calls, _ = self._setup_calls()
-        self.assertEqual(calls[0], ["start", "d"])
-        self.assertTrue(any("exec" in call for call in calls))
+    def test_setup_waits_for_readiness_before_any_configuration_command(self):
+        # The readiness probe is an `sbx exec`, which Docker documents as starting
+        # a stopped sandbox. Setup must wait for that gate before its first cp/exec
+        # configuration command, rather than issuing a separate or interactive run.
+        with tempfile.TemporaryDirectory() as tmp:
+            cs.CONFIG = cs.parse_args(["-n", "d", "-p", tmp])
+            with mock.patch.object(cs, "sbx") as fake_sbx, mock.patch.object(
+                cs, "wait_for_sandbox", return_value=True
+            ) as wait:
+                ordered = mock.Mock()
+                ordered.attach_mock(wait, "wait")
+                ordered.attach_mock(fake_sbx, "sbx")
+                cs.setup_sandbox()
+
+        calls = [call[0] for call in ordered.mock_calls]
+        self.assertEqual(calls[0], "wait")
+        self.assertIn("sbx", calls)
 
     def test_no_env_file_is_passed_as_a_dash_not_an_empty_argument(self):
         # An empty positional does not survive `sbx exec` reliably, so the tail is

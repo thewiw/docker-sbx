@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository contains scripts that install the [Docker Sandboxes](https://docs.docker.com/reference/cli/sbx/) engine and automate creation of AI agent sandboxes using Claude Code. Each sandbox is an isolated Docker container with a shared project volume and a restrictive network policy.
 
-The bash scripts are tested on WSL Ubuntu 24.04/26.04 LTS and native Ubuntu 26.04 LTS. The host scripts are being migrated to cross-platform Python (Linux/WSL, macOS, Windows).
+The bash scripts are tested on WSL Ubuntu 24.04/26.04 LTS, native Ubuntu 26.04 LTS and Windows 11. The host scripts are being migrated to cross-platform Python (Linux/WSL, macOS, Windows).
 
 ## Scripts
 
@@ -18,13 +18,14 @@ Scripts that run on the **host** live in the repository root and are run from th
 | `docker-sbx-install.py` | Cross-platform replacement for `docker-sbx-install.sh`, runnable on Linux/WSL, macOS and Windows (Python 3.9+, standard library only). Does the same setup: installs or updates Docker, installs the `sbx` CLI, signs in, sets the global network policy, and persists the environment variables. `--dry-run` prints every command and changes nothing, and needs no privilege on any platform. Needs `sudo` on Linux; runs as a regular user on Windows and macOS (Homebrew refuses to run as root). The only Windows step needing administrator rights — enabling the Windows Hypervisor Platform — is probed first and demanded only when the feature is missing. |
 | `docker-sbx-create-sandbox.sh` | Creates a new sandbox for a project. Scans the project for secrets (file patterns + gitleaks), runs `sbx create`, then copies `sandbox/docker-sbx-setup-sandbox.sh` into the sandbox and executes it. Optionally applies per-sandbox policy profiles. |
 | `docker-sbx-create-sandbox.py` | Cross-platform replacement for `docker-sbx-create-sandbox.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options and the same user-facing messages; `--dry-run` prints every command and creates nothing. Profiles are YAML: PyYAML is used when importable, otherwise a small parser covers the documented profile subset. It waits for the new sandbox's first start to finish before configuring it, refuses to reuse an existing sandbox name, and treats a failed `sbx create` as fatal — the bash version's `sbx()` calls are non-fatal (mirroring the original), so a failed create used to be followed by setup against the *previous* sandbox of that name. |
-| `sandbox/docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox, after the host has waited for the sandbox's first start to finish. Takes the project path and an optional env-file path (or `-`). Installs `jq` **only if it is missing** — that is the only `apt` use, and it never kills `apt`/`dpkg` or upgrades packages, because the sandbox runs its own `apt` at boot (`/etc/durable-startup.d/001-startup-claude/001-cmd.sh`) and is still installing its agent during that first start. Writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`. It deliberately does **not** create a `~/workspace` symlink: the project is already mounted at its host path. Also installs the optional Slack notification hook when the env file asks for it. |
+| `sandbox/docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox, after the host has waited for the sandbox's first start to finish. Takes the project path and an optional env-file path (or `-`). Installs `jq` **only if it is missing** — that is the only `apt` use, and it never kills `apt`/`dpkg` or upgrades packages, because the sandbox runs its own `apt` at boot (`/etc/durable-startup.d/001-startup-claude/001-cmd.sh`) and is still installing its agent during that first start. Writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`. It deliberately does **not** create a `~/workspace` symlink: the project is already mounted at its host path. Also installs the optional Slack and/or Nextcloud Talk notification hooks when the env file asks for them. The two providers share one body of code here (`write_notify_env`, `wire_notify_hooks`, `hook_var`) parameterised by variable prefix; each has its own installer gated by its own `<PREFIX>_ENABLED`, so a sandbox can run Slack only, Talk only, or both, and each wires its own hook script without disturbing the other. |
 | `sandbox/docker-sbx-slack-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/slack-notify.sh`. Invoked by Claude Code as a hook with the event payload on stdin; posts one short line per lifecycle event to Slack. Only installed when the optional feature is enabled via the env file. |
+| `sandbox/docker-sbx-nctalk-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/nctalk-notify.sh`. The Nextcloud Talk counterpart of the Slack hook — same architecture, same event vocabulary and message format — posting via the Talk spreed OCS API (`<url>/ocs/v2.php/apps/spreed/api/v1/chat/<room>`) with the app password as basic auth. All its variables carry the `SBX_NCTALK_` prefix and `SBX_NCTALK_ENABLED` is its master switch. Only installed when the feature is enabled via the env file; independent of the Slack hook. |
 | `docker-sbx-update-sandboxes.sh` | Maintenance helper. Runs `apt update/upgrade/autoremove` inside existing sandboxes via `sbx exec`, one at a time. Enumerates with `sbx ls` (or a custom `SBX_LS_CMD`), selectable with `-i`/`-x`; `DRY_RUN=1` prints instead of running. Not part of sandbox creation. |
 | `docker-sbx-update-sandboxes.py` | Cross-platform replacement for `docker-sbx-update-sandboxes.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options, the same user-facing messages and the same exit codes (0 clean, 1 when a sandbox fails, 2 on bad usage); adds a `--dry-run` flag alongside `DRY_RUN=1`. Lists sandboxes from `SBX_LS_CMD`, then `sbx ls -q`, then `sbx ls --json`, then the human-readable table — the JSON branch walks the parsed document itself, so `jq` is no longer needed. `SBX_LS_CMD` runs through the platform shell (`sh -c`, or `cmd /c` on Windows); the `sh -c` handed to `sbx exec` stays `sh -c`, since that one runs inside the sandbox. The query timeout (`SBX_TIMEOUT`) is enforced by `subprocess`, **not** by a `timeout(1)` binary: Windows ships an unrelated `timeout.exe` (it *waits* N seconds) under that name, so looking one up by name found it and prefixed every query with `timeout 120 sbx …`, which Windows rejected — every query failed and the script reported "no sandboxes found". A `SBX_TIMEOUT` that is not a positive number now exits 2 before the first query instead of failing each one. |
-| `test/run-tests.sh` | Test suite for the Slack notification feature, the env-file contract and the `create-sandbox` CLI. Exercises the hook, the settings merge, failure logging, and a real POST to a loopback sink. The CLI-level tests (1-12) now run against the Python implementation only — the bash host script was deleted when the migration completed — but `SBX_IMPLS` still selects, so a checkout that has both runs the same assertions against each and catches them drifting apart. Run directly on the host (`bash test/run-tests.sh`); no sandbox required. |
+| `test/run-tests.sh` | Test suite for the Slack and Nextcloud Talk notification features, the env-file contract and the `create-sandbox` CLI. Exercises the hooks, the settings merge (including both providers enabled together), failure logging, and a real POST to a loopback sink. The CLI-level tests (1-12) now run against the Python implementation only — the bash host script was deleted when the migration completed — but `SBX_IMPLS` still selects, so a checkout that has both runs the same assertions against each and catches them drifting apart. Run directly on the host (`bash test/run-tests.sh`); no sandbox required. |
 | `test/test_docker_sbx_install.py` | Unit tests for the pure helpers in `docker-sbx-install.py` (prompt parsing, platform/locale selection, profile path, environment-block idempotency). Run with `python3 -m unittest discover -s test -p 'test_*.py'`. |
-| `test/test_create_sandbox.py` | Unit tests for the pure helpers in `docker-sbx-create-sandbox.py` (argument parsing, env-file reading, volume specs, Slack validation, host extraction, the secrets-file scanner, the minimal YAML profile parser, the sandbox-name pre-check and the wait for a sandbox's first start). Same command as above. |
+| `test/test_create_sandbox.py` | Unit tests for the pure helpers in `docker-sbx-create-sandbox.py` (argument parsing, env-file reading, volume specs, Slack and Nextcloud Talk validation, host extraction, the provider-script staging, the secrets-file scanner, the minimal YAML profile parser, the sandbox-name pre-check and the wait for a sandbox's first start). Same command as above. |
 | `test/test_update_sandboxes.py` | Unit tests for the pure helpers in `docker-sbx-update-sandboxes.py` (list normalisation, CLI parsing and its exit-2 messages, the apt chain, exec-flag detection, and the three sandbox-name extraction paths). Same command as above; needs no `sbx` and no sandbox. |
 | `profiles/` | YAML policy profiles used by `docker-sbx-create-sandbox.sh` to grant a sandbox access to language-specific external resources. |
 
@@ -33,7 +34,8 @@ Scripts that run on the **host** live in the repository root and are run from th
 - **Default network policy**: deny-all. Only `archive.ubuntu.com`, `security.ubuntu.com`, and `download.docker.com` are allowed globally. Explicit deny rules are also set for GitHub, GitLab, Bitbucket, and Postman domains.
 - **Secret scanning**: before a sandbox is created, the script checks for credential files (`google-services.json`, `key.properties`, `*.jks`, `*.cert`, `*.crt`, `*.key`) and runs `gitleaks` against the project's git repository. Creation aborts if secrets are found.
 - **Shared volume**: the project directory is mounted as a shared volume. Claude Code has write access to the entire sandbox filesystem, including this volume. Do not place credentials inside the project path or in git history.
-- **Slack notifications** (optional): when enabled, the sandbox's own network policy is extended with just the endpoint the configured credential style needs (`hooks.slack.com` for a webhook, `slack.com` for a bot token) — no global rule is added. The credential is written to `~/.claude/hooks/slack.env`, mode `600`, outside the project volume. It is still readable by the agent in that sandbox, so scope the credential to what you are willing to expose there: an incoming webhook bound to a single channel is least privilege, a bot token (`chat:write`) can post anywhere the bot is a member. `docker-sbx-create-sandbox.sh` aborts if `SBX_SLACK_ENABLED=true` but no usable target is configured, rather than silently installing a hook that can never deliver.
+- **Slack notifications** (optional): when enabled, the sandbox's own network policy is extended with just the endpoint the configured credential style needs (`hooks.slack.com` for a webhook, `slack.com` for a bot token) — no global rule is added. The credential is written to `~/.claude/hooks/slack.env`, mode `600`, outside the project volume. It is still readable by the agent in that sandbox, so scope the credential to what you are willing to expose there: an incoming webhook bound to a single channel is least privilege, a bot token (`chat:write`) can post anywhere the bot is a member. `docker-sbx-create-sandbox.py` aborts if `SBX_SLACK_ENABLED=true` but no usable target is configured, rather than silently installing a hook that can never deliver.
+- **Nextcloud Talk notifications** (optional): the second provider, independent of Slack. When `SBX_NCTALK_ENABLED=true`, the sandbox's network policy is extended with the Nextcloud instance's host only (from `SBX_NCTALK_URL`) — no global rule. The Nextcloud user, app password and room token are written to `~/.claude/hooks/nctalk.env`, mode `600`, outside the project volume and separate from `slack.env`; the app password is still readable by the agent in that sandbox, so scope it to an account you are willing to expose there — it can act as that user for every API call. Creation aborts, naming the missing variable, if `SBX_NCTALK_ENABLED=true` but `SBX_NCTALK_URL`, `SBX_NCTALK_USER`, `SBX_NCTALK_TOKEN` or `SBX_NCTALK_ROOM` is absent. Slack and Talk may be enabled at the same time.
 
 ## Creating a Sandbox
 
@@ -122,10 +124,19 @@ ANTHROPIC_AUTH_TOKEN=ollama
 
 When `ANTHROPIC_BASE_URL` is set, the setup script sets `ANTHROPIC_AUTH_TOKEN`.
 
-## Slack Notifications (optional)
+## Notifications (optional)
 
-Off by default, enabled purely through `-e`; there are no CLI flags. With no `SBX_SLACK_*`
-variables present the sandbox is configured exactly as it was before.
+Two providers, **Slack** and **Nextcloud Talk**, share one architecture. Each is off by
+default and enabled purely through `-e`; there are no CLI flags. With no `SBX_SLACK_*` and
+no `SBX_NCTALK_*` variables present the sandbox is configured exactly as it was before.
+They are independent: either can be enabled, or both at once, and enabling one never
+affects the other (each has its own `*_ENABLED` master switch, its own `.env` file, and its
+own hook script wired separately into `settings.json`). In `sandbox/docker-sbx-setup-sandbox.sh`
+the two share `hook_var`, `write_notify_env` and `wire_notify_hooks`, parameterised by
+variable prefix; the host side mirrors this with `validate_slack_config`/`validate_nctalk_config`,
+the shared `validate_notify_events`, and `update_sbx_policy_slack`/`update_sbx_policy_nctalk`.
+
+### Slack
 
 ```
 SBX_SLACK_ENABLED=true
@@ -152,14 +163,58 @@ What gets installed inside the sandbox:
 
 Things to keep in mind when editing this feature:
 
-- The hook sits on the critical path of every enabled event: always exit 0, print nothing, and cap network calls with `curl --max-time`.
+- The hook sits on the critical path of every enabled event: always exit 0, never write to stdout (dry-run diagnostics go to stderr), and cap network calls with `curl --max-time`.
 - Failures are recorded, not swallowed. A post that never lands is silent on the agent's side, so before `slack-errors.log` existed a revoked webhook, a bot that was never invited and a request blocked by the network policy all looked identical to success. Keep the distinction: Slack reports API errors (`not_in_channel`, `invalid_auth`, `missing_scope`) as **HTTP 200 with `ok:false`**, so the response body — not the status code — is what decides success in bot-token mode. The log is truncated past 64 KB and never contains a webhook path (`log_safe_url` strips it, since the path is the credential). Bot-token failures also name the channel that was tried: `channel_not_found` and `not_in_channel` are only distinguishable by seeing what was actually sent — a channel id, a `#name`, or a value that still carried CRLF are indistinguishable from Slack's reply alone.
 - The POST must declare `Content-type: application/json`. curl's default for `--data-binary` is `application/x-www-form-urlencoded`, and Slack — told to expect form data but handed JSON — answers HTTP 200 `{"ok":false,"error":"invalid_form_data"}` rather than a 4xx. The header is therefore set once inside `post_request`, not at each call site, and `run-tests.sh` asserts it on the wire: a sink that merely reads the body cannot tell a good request from this broken one, which is how the header was once lost in a refactor without any test noticing.
-- The two halves must agree on how the env file is parsed. `env_file_get` (host) trims surrounding whitespace; `load_env_file` (sandbox) must strip at least a trailing CR, because a CRLF env file — the default from a Windows editor on WSL — otherwise yields `true\r`, which is not `true`. When they disagree the host reports the feature as enabled while the sandbox installs nothing, so `install_slack_hook` also warns loudly rather than no-op'ing when `SBX_SLACK_ENABLED` is set to anything unrecognised. Both guards are covered by `run-tests.sh`.
+- Bot tokens and secret webhook URLs are passed through `curl --config -` on stdin, not through curl's argument list, so they do not appear in `ps`. `run-tests.sh` checks both the argv and the stdin configuration with a stub, while the loopback sink verifies the request on the wire.
+- The two halves must agree on how the env file is parsed. `env_file_get` (host) trims surrounding whitespace; `load_env_file` (sandbox) must strip at least a trailing CR, because a CRLF env file — the default from a Windows editor on WSL — otherwise yields `true\r`, which is not `true`. When they disagree the host reports the feature as enabled while the sandbox installs nothing, so `install_slack_hook`/`install_nctalk_hook` also warn loudly rather than no-op'ing when their `*_ENABLED` is set to anything unrecognised. Both guards are covered by `run-tests.sh`.
 - `slack.env` is **sourced** by the hook, so values are written as single-quoted shell literals — a project path containing quotes, `<`, `&` or `$(…)` has to stay inert.
 - Escape `&`, `<`, `>` before posting: Slack treats a bare `<` as the start of a link/mention entity. Use `sed` rather than `${var//pat/repl}` — from bash 5.2 (Ubuntu 24.04+) `patsub_replacement` is on by default, so `&` in the replacement means "the matched text" and turns `&lt;` into `<lt;`.
 - `env_file_get` in `docker-sbx-create-sandbox.sh` ends with `|| true` on purpose: that script runs with `set -o pipefail`, so an absent key would otherwise abort creation through `set -e`.
 - The mechanism is verified, not assumed: a settings-level `hooks` block does fire, `matcher` is optional for lifecycle events, and the payload arrives on stdin. `run-tests.sh` covers the env contract (including a CRLF env file), the merge, failure logging, and a real POST to a loopback endpoint.
+
+### Nextcloud Talk
+
+All variables carry the `SBX_NCTALK_` prefix; `SBX_NCTALK_ENABLED` is the master switch. It
+posts through the Talk **spreed** OCS API, so nothing is provisioned for the operator: the
+Nextcloud user, its app password and the room must already exist.
+
+```
+SBX_NCTALK_ENABLED=true
+SBX_NCTALK_URL=https://cloud.example.com           # Nextcloud base URL
+SBX_NCTALK_USER=agent                              # user the app password belongs to
+SBX_NCTALK_TOKEN=xxxxx-xxxxx-xxxxx-xxxxx-xxxxx     # app password (not the login password)
+SBX_NCTALK_ROOM=abc123XYZ                          # Talk room token (…/call/abc123XYZ)
+SBX_NCTALK_EVENTS=Stop,Notification,SessionStart,SessionEnd
+SBX_NCTALK_PREFIX=[docker-sbx]                     # optional, prepended
+SBX_NCTALK_DRYRUN=true                             # optional, print instead of post
+```
+
+- All four of URL/USER/TOKEN/ROOM are required when enabled; creation aborts and names each
+  missing one. Per-event room override: append the upper-cased event name, e.g.
+  `SBX_NCTALK_ROOM_NOTIFICATION`. Same accepted events and same message format as Slack.
+- The endpoint is `<SBX_NCTALK_URL>/ocs/v2.php/apps/spreed/api/v1/chat/<room>`, with the app
+  password as HTTP basic auth, `Content-Type: application/json`, and `OCS-APIRequest: true`.
+- What gets installed: `~/.claude/hooks/nctalk-notify.sh` (755), `~/.claude/hooks/nctalk.env`
+  (600), and `~/.claude/hooks/nctalk-errors.log` (600, one line per failed post, created on
+  the first failure). Its `hooks` entries are merged alongside any Slack entries — the merge
+  matches on the exact command path, so wiring one provider never disturbs the other.
+- The host side allows the Nextcloud instance's host in the per-sandbox policy and nothing
+  more.
+
+Things to keep in mind when editing the Talk provider:
+
+- It mirrors the Slack hook deliberately; keep the two in step. A change to the message
+  format, the event set, the env-file parsing or the failure-logging shape should be made in
+  both, and `run-tests.sh` runs the same assertions against each.
+- Nextcloud Talk renders messages as Markdown and has no link/mention entity, so unlike
+  Slack the text is **not** HTML-escaped — do not "port" `escape_slack` across.
+- An OCS reply carries its own `ocs.meta.statuscode`, but `v2.php` mirrors it in the HTTP
+  status, so success is decided by a `2xx` status (as for the Slack webhook mode); a non-2xx
+  is logged with its status, the room and the response body. The room token (a destination
+  id) is logged like Slack's channel id, while `log_safe_url` keeps the path out of the line.
+- The app password is passed to curl as basic auth through `curl --config -` on stdin, not
+  through `-u` on its command line, so it does not appear in the process argument list.
 
 ## Using a Sandbox
 

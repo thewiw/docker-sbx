@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # --------------------------------------------------------------------------
 # Constants
@@ -71,6 +72,10 @@ SUPPORTED_SLACK_EVENTS = (
     "UserPromptSubmit",
 )
 DEFAULT_SLACK_EVENTS = "Stop,Notification,SessionStart,SessionEnd"
+
+# Nextcloud Talk notifications share the same event vocabulary and default set.
+SUPPORTED_NCTALK_EVENTS = SUPPORTED_SLACK_EVENTS
+DEFAULT_NCTALK_EVENTS = DEFAULT_SLACK_EVENTS
 
 # A profile may never imply a global policy - it is always per-sandbox.
 FORBIDDEN_PROFILE_KEYS = ("global", "default", "all_sandboxes", "sandbox_default")
@@ -550,7 +555,8 @@ def existing_sandbox_names():
 def sandbox_ready() -> bool:
     """Has the sandbox finished its first start - runtime up, agent installed?
 
-    `sbx exec` cannot succeed before the runtime is up, and the agent binary only
+    Docker documents `sbx exec` as starting a stopped sandbox first, so this probe
+    is also the noninteractive startup mechanism. The agent binary only
     exists once that first start has provisioned it, so testing for the binary is
     what actually tells us the boot is over. A non-login exec does not inherit
     `~/.local/bin` on PATH (the template's own startup hook exports it by hand), so
@@ -612,30 +618,35 @@ def setup_sandbox() -> None:
     banner(f"Updating sandbox {name()}")
     info()
 
-    # Configuring the sandbox means running commands inside it, and that is also
-    # what starts it - so wait for the first start to finish before touching it.
-    # `sbx start` is not fatal: if the runtime refuses to come up, its own message
-    # is more useful than ours, and the readiness probe below is what decides.
-    sbx(["start", name()])
+    # Docker documents `sbx exec` as starting a stopped sandbox before running the
+    # command. sandbox_ready() uses `sbx exec`, so its probes both trigger startup
+    # when needed and wait for first-start agent provisioning to finish. No separate
+    # start command (or interactive `sbx run`) is needed before configuring it.
     if not wait_for_sandbox():
         die(
             f"sandbox '{name()}' did not start within {SANDBOX_READY_TIMEOUT}s, so it was "
             "left unconfigured.\n"
-            f"       Find out why it will not start (sbx diagnose, then `sbx start {name()}`), "
-            f"and re-run this command once `sbx run {name()}` works."
+            f"       Check the runtime (sbx diagnose), then re-run this command once "
+            f"`sbx run {name()}` works."
         )
 
     setup_script = script_dir() / "sandbox" / "docker-sbx-setup-sandbox.sh"
     slack_script = script_dir() / "sandbox" / "docker-sbx-slack-notify.sh"
+    nctalk_script = script_dir() / "sandbox" / "docker-sbx-nctalk-notify.sh"
 
     sbx(["cp", str(setup_script), f"{name()}:{SBX_HOME}/setup-sandbox.sh"])
     sbx(["exec", "-ti", name(), "sudo", "chmod", "755", f"{SBX_HOME}/setup-sandbox.sh"])
 
-    # The Slack hook script is staged only when the feature is switched on, so a
-    # sandbox without it keeps exactly the previous behaviour.
+    # Each provider's hook script is staged only when that feature is switched on,
+    # so a sandbox without it keeps exactly the previous behaviour. They are
+    # independent: one, the other, or both may be enabled together.
     if slack_enabled():
         sbx(["cp", str(slack_script), f"{name()}:{SBX_HOME}/slack-notify.sh"])
         sbx(["exec", "-ti", name(), "sudo", "chmod", "755", f"{SBX_HOME}/slack-notify.sh"])
+
+    if nctalk_enabled():
+        sbx(["cp", str(nctalk_script), f"{name()}:{SBX_HOME}/nctalk-notify.sh"])
+        sbx(["exec", "-ti", name(), "sudo", "chmod", "755", f"{SBX_HOME}/nctalk-notify.sh"])
 
     # The in-sandbox script takes the project path and the env-file path, with "-"
     # standing in for "no env file": an empty argument does not survive the trip
@@ -743,6 +754,29 @@ def slack_events() -> str:
     return events if events else DEFAULT_SLACK_EVENTS
 
 
+def nctalk_enabled() -> bool:
+    return env_file_get("SBX_NCTALK_ENABLED") == "true"
+
+
+def nctalk_events() -> str:
+    events = env_file_get("SBX_NCTALK_EVENTS")
+    return events if events else DEFAULT_NCTALK_EVENTS
+
+
+def validate_notify_events(events: str, varname: str, supported) -> None:
+    """Abort on an event name outside the supported set, naming the variable."""
+    for event in events.split(","):
+        event = event.replace(" ", "")
+        if not event:
+            continue
+        if event not in supported:
+            info()
+            die(
+                f"unsupported {varname} entry '{event}'\n"
+                "       Supported events: " + ", ".join(supported)
+            )
+
+
 def validate_slack_config() -> None:
     if not slack_enabled():
         return
@@ -758,16 +792,43 @@ def validate_slack_config() -> None:
             "       Set SBX_SLACK_WEBHOOK_URL, or SBX_SLACK_BOT_TOKEN together with SBX_SLACK_CHANNEL."
         )
 
-    for event in slack_events().split(","):
-        event = event.replace(" ", "")
-        if not event:
-            continue
-        if event not in SUPPORTED_SLACK_EVENTS:
-            info()
-            die(
-                f"unsupported SBX_SLACK_EVENTS entry '{event}'\n"
-                "       Supported events: " + ", ".join(SUPPORTED_SLACK_EVENTS)
-            )
+    validate_notify_events(slack_events(), "SBX_SLACK_EVENTS", SUPPORTED_SLACK_EVENTS)
+
+
+def validate_nctalk_config() -> None:
+    if not nctalk_enabled():
+        return
+
+    missing = [
+        key
+        for key in ("SBX_NCTALK_URL", "SBX_NCTALK_USER", "SBX_NCTALK_TOKEN", "SBX_NCTALK_ROOM")
+        if not env_file_get(key)
+    ]
+    if missing:
+        info()
+        die(
+            "SBX_NCTALK_ENABLED is true but no usable Nextcloud Talk target is configured.\n"
+            "       Set " + ", ".join(missing) + "."
+        )
+
+    url = env_file_get("SBX_NCTALK_URL")
+    try:
+        parsed = urlsplit(url)
+        # Accessing port validates it; urlsplit otherwise accepts values such as
+        # 'https://host:not-a-port', which curl would reject only at event time.
+        parsed.port
+        valid_url = (
+            parsed.scheme.lower() in ("http", "https")
+            and bool(parsed.hostname)
+            and not any(char.isspace() for char in url)
+        )
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        info()
+        die("SBX_NCTALK_URL must be an absolute http:// or https:// URL with a valid host.")
+
+    validate_notify_events(nctalk_events(), "SBX_NCTALK_EVENTS", SUPPORTED_NCTALK_EVENTS)
 
 
 def update_sbx_policy_slack() -> None:
@@ -793,6 +854,23 @@ def update_sbx_policy_slack() -> None:
     for host in hosts:
         info(f"  allowing {host}")
         sbx(["policy", "allow", "network", "--sandbox", name(), host])
+
+
+def update_sbx_policy_nctalk() -> None:
+    if not nctalk_enabled():
+        return
+
+    # The whole Nextcloud instance is served from one host, so allowing it covers
+    # the Talk endpoint. Without this the sandbox's deny-by-default policy would
+    # silently drop every notification.
+    host = host_from_url(env_file_get("SBX_NCTALK_URL"))
+    if not host:
+        return
+
+    info()
+    info(f"Allowing Nextcloud Talk endpoint in sandbox {name()} network policy")
+    info(f"  allowing {host}")
+    sbx(["policy", "allow", "network", "--sandbox", name(), host])
 
 
 # --------------------------------------------------------------------------
@@ -1081,6 +1159,7 @@ def main(argv=None) -> int:
     # passed in: the bash implementation has no `sbx` precondition, so validating
     # Slack after it made the two report different errors on a host without `sbx`.
     validate_slack_config()
+    validate_nctalk_config()
 
     # Fail fast, before the secret scan and before anything is created. Individual
     # `sbx` calls are deliberately non-fatal (sbx() runs with check=False, as the
@@ -1098,6 +1177,7 @@ def main(argv=None) -> int:
     setup_sandbox()
     update_sbx_policy()
     update_sbx_policy_slack()
+    update_sbx_policy_nctalk()
     apply_profiles()
     return 0
 

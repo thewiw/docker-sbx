@@ -6,7 +6,7 @@ envfilepath=${2:-}
 [[ "$envfilepath" == "-" ]] && envfilepath=""
 
 install_tools() {
-  # jq is required by the settings merge and the Slack hook further down. The
+  # jq is required by the settings merge and both notification hooks below. The
   # template ships it, so this normally does nothing; installing it is the only
   # reason this script touches apt at all.
   #
@@ -86,7 +86,13 @@ cleanup_env_file() {
 }
 
 # ----------------------------------------------------------------------
-# Optional Slack notifications -----------------------------------------
+# Optional notifications (Slack, Nextcloud Talk) -----------------------
+#
+# Both providers share one body of code here: an env-file writer, a settings.json
+# hook merger, and a per-provider installer that validates the credential(s) it
+# needs. Each provider is switched on by its own <PREFIX>_ENABLED variable, and
+# each wires its own hook script into settings.json, so a sandbox can notify over
+# Slack only, over Nextcloud Talk only, or over both at the same time.
 # ----------------------------------------------------------------------
 
 unquote() {
@@ -100,34 +106,57 @@ unquote() {
   printf '%s' "$v"
 }
 
-slack_var() {
-  # Value of a SBX_SLACK_* variable, unquoted, from the exported environment.
+hook_var() {
+  # Value of a notification variable (SBX_SLACK_* / SBX_NCTALK_*), unquoted, from
+  # the exported environment.
   unquote "${!1:-}"
 }
 
+trim_space() {
+  # Trim surrounding whitespace. The host side trims it too (env_file_get), so a
+  # padded value must not leave the host staging a hook that this script then
+  # refuses to install, which is the mismatch the installers warn about below.
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"
+  v="${v%"${v##*[![:space:]]}"}"
+  printf '%s' "$v"
+}
+
 shell_single_quote() {
-  # Render a value as a single-quoted shell literal. slack.env is sourced by the
-  # hook on every event, so a project path containing quotes, spaces, <, & or
+  # Render a value as a single-quoted shell literal. The *.env file is sourced by
+  # the hook on every event, so a project path containing quotes, spaces, <, & or
   # $(...) must not be able to break out of the assignment.
   printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
-write_slack_env() {
-  local hooks_dir="$1"
-  local events="$2"
-  local target="$hooks_dir/slack.env"
+# The default event set, shared by every provider.
+default_notify_events() {
+  printf 'Stop,Notification,SessionStart,SessionEnd'
+}
+
+write_notify_env() {
+  # write_notify_env PREFIX ENVFILE EVENTS SHARED SEGMENTS
+  #   PREFIX   SBX_SLACK / SBX_NCTALK - the variable prefix, and the source of the
+  #            <PREFIX>_SANDBOX / <PREFIX>_PROJECT labels baked into the file.
+  #   ENVFILE  absolute path of the file to write (mode 600).
+  #   SHARED   space-separated variable suffixes copied verbatim, e.g.
+  #            "WEBHOOK_URL BOT_TOKEN CHANNEL PREFIX DRYRUN".
+  #   SEGMENTS space-separated suffixes that also get a per-event override named
+  #            <PREFIX>_<SEGMENT>_<EVENT>, e.g. "WEBHOOK CHANNEL" (Slack) or
+  #            "ROOM" (Nextcloud Talk).
+  local prefix="$1" target="$2" events="$3" shared="$4" segments="$5"
   local tmp name value event suffix event_list
 
   tmp="$(mktemp "${target}.tmp.XXXXXX")" || return 1
 
   {
-    printf 'SBX_SLACK_SANDBOX=%s\n' "$(shell_single_quote "$(slack_var SBX_SLACK_SANDBOX)")"
-    printf 'SBX_SLACK_PROJECT=%s\n' "$(shell_single_quote "$(slack_var SBX_SLACK_PROJECT)")"
+    printf '%s=%s\n' "${prefix}_SANDBOX" "$(shell_single_quote "$(hook_var "${prefix}_SANDBOX")")"
+    printf '%s=%s\n' "${prefix}_PROJECT" "$(shell_single_quote "$(hook_var "${prefix}_PROJECT")")"
 
-    for name in SBX_SLACK_WEBHOOK_URL SBX_SLACK_BOT_TOKEN SBX_SLACK_CHANNEL SBX_SLACK_PREFIX SBX_SLACK_DRYRUN; do
-      value="$(slack_var "$name")"
+    for name in $shared; do
+      value="$(hook_var "${prefix}_${name}")"
       if [[ -n "$value" ]]; then
-        printf '%s=%s\n' "$name" "$(shell_single_quote "$value")"
+        printf '%s=%s\n' "${prefix}_${name}" "$(shell_single_quote "$value")"
       fi
     done
 
@@ -139,10 +168,10 @@ write_slack_env() {
         continue
       fi
       suffix="${event^^}"
-      for name in "SBX_SLACK_WEBHOOK_${suffix}" "SBX_SLACK_CHANNEL_${suffix}"; do
-        value="$(slack_var "$name")"
+      for name in $segments; do
+        value="$(hook_var "${prefix}_${name}_${suffix}")"
         if [[ -n "$value" ]]; then
-          printf '%s=%s\n' "$name" "$(shell_single_quote "$value")"
+          printf '%s=%s\n' "${prefix}_${name}_${suffix}" "$(shell_single_quote "$value")"
         fi
       done
     done
@@ -152,9 +181,12 @@ write_slack_env() {
   mv -f "$tmp" "$target"
 }
 
-wire_slack_hooks() {
-  local hooks_dir="$1"
-  local events="$2"
+wire_notify_hooks() {
+  # wire_notify_hooks SCRIPT EVENTS
+  # Merge one hook entry per event for SCRIPT into ~/.claude/settings.json. Only
+  # entries whose command is exactly SCRIPT are replaced, so enabling both Slack
+  # and Nextcloud Talk leaves the other provider's entries untouched.
+  local script="$1" events="$2"
   local target="$HOME/.claude/settings.json"
   local tmp events_json
 
@@ -171,11 +203,12 @@ wire_slack_hooks() {
 
   tmp="$(mktemp "${target}.tmp.XXXXXX")" || return 1
 
-  if jq --arg script "$hooks_dir/slack-notify.sh" --argjson events "$events_json" '
+  if jq --arg script "$script" --argjson events "$events_json" '
       .hooks //= {} |
-      # Drop anything docker-sbx installed earlier, so re-running setup does not
-      # accumulate duplicates and an event that is no longer requested does not
-      # keep its old hook. Identified by the command path.
+      # Drop anything docker-sbx installed earlier for this script, so re-running
+      # setup does not accumulate duplicates and an event that is no longer
+      # requested does not keep its old hook. Identified by the command path, so
+      # the entries of another provider (a different script) are left alone.
       reduce (.hooks | keys_unsorted[]) as $k (.;
         .hooks[$k] = [ .hooks[$k][] | select(([.hooks[]?.command] | index($script)) == null) ]
         | if (.hooks[$k] | length) == 0 then del(.hooks[$k]) else . end) |
@@ -187,19 +220,14 @@ wire_slack_hooks() {
     mv -f "$tmp" "$target"
   else
     rm -f "$tmp"
-    printf 'Error: could not update %s for the Slack hook - file left unchanged\n' "$target" >&2
+    printf 'Error: could not update %s for the notification hook - file left unchanged\n' "$target" >&2
     return 1
   fi
 }
 
 install_slack_hook() {
   local enabled
-  enabled="$(slack_var SBX_SLACK_ENABLED)"
-  # The host side trims surrounding whitespace (env_file_get), so mirror that here:
-  # otherwise a padded value would leave the host staging a hook that this script
-  # then refuses to install, which is the mismatch the warning below reports.
-  enabled="${enabled#"${enabled%%[![:space:]]*}"}"
-  enabled="${enabled%"${enabled##*[![:space:]]}"}"
+  enabled="$(trim_space "$(hook_var SBX_SLACK_ENABLED)")"
 
   if [[ "$enabled" != "true" ]]; then
     # A set-but-unrecognised value used to be a silent no-op, leaving the host
@@ -211,18 +239,18 @@ install_slack_hook() {
   fi
 
   local webhook token channel events
-  webhook="$(slack_var SBX_SLACK_WEBHOOK_URL)"
-  token="$(slack_var SBX_SLACK_BOT_TOKEN)"
-  channel="$(slack_var SBX_SLACK_CHANNEL)"
+  webhook="$(hook_var SBX_SLACK_WEBHOOK_URL)"
+  token="$(hook_var SBX_SLACK_BOT_TOKEN)"
+  channel="$(hook_var SBX_SLACK_CHANNEL)"
 
   if [[ -z "$webhook" && ( -z "$token" || -z "$channel" ) ]]; then
     echo "Warning: SBX_SLACK_ENABLED is set but no usable Slack target, skipping"
     return 0
   fi
 
-  events="$(slack_var SBX_SLACK_EVENTS)"
+  events="$(hook_var SBX_SLACK_EVENTS)"
   if [[ -z "$events" ]]; then
-    events="Stop,Notification,SessionStart,SessionEnd"
+    events="$(default_notify_events)"
   fi
 
   # Labels shown in the message. The sandbox name is not in the hook payload, so
@@ -242,16 +270,72 @@ install_slack_hook() {
   mv -f "$stage" "$hooks_dir/slack-notify.sh"
   chmod 755 "$hooks_dir/slack-notify.sh"
 
-  if ! write_slack_env "$hooks_dir" "$events"; then
+  if ! write_notify_env SBX_SLACK "$hooks_dir/slack.env" "$events" \
+       "WEBHOOK_URL BOT_TOKEN CHANNEL PREFIX DRYRUN" "WEBHOOK CHANNEL"; then
     echo "Warning: could not write $hooks_dir/slack.env, skipping Slack hook"
     return 0
   fi
 
-  if ! wire_slack_hooks "$hooks_dir" "$events"; then
+  if ! wire_notify_hooks "$hooks_dir/slack-notify.sh" "$events"; then
     return 0
   fi
 
   echo "Slack notifications enabled for: $events"
+}
+
+install_nctalk_hook() {
+  local enabled
+  enabled="$(trim_space "$(hook_var SBX_NCTALK_ENABLED)")"
+
+  if [[ "$enabled" != "true" ]]; then
+    if [[ -n "$enabled" ]]; then
+      echo "Warning: SBX_NCTALK_ENABLED is '$enabled', expected 'true' - skipping Nextcloud Talk hook"
+    fi
+    return 0
+  fi
+
+  local url user token room events
+  url="$(hook_var SBX_NCTALK_URL)"
+  user="$(hook_var SBX_NCTALK_USER)"
+  token="$(hook_var SBX_NCTALK_TOKEN)"
+  room="$(hook_var SBX_NCTALK_ROOM)"
+
+  if [[ -z "$url" || -z "$user" || -z "$token" || -z "$room" ]]; then
+    echo "Warning: SBX_NCTALK_ENABLED is set but no usable Nextcloud Talk target, skipping"
+    return 0
+  fi
+
+  events="$(hook_var SBX_NCTALK_EVENTS)"
+  if [[ -z "$events" ]]; then
+    events="$(default_notify_events)"
+  fi
+
+  SBX_NCTALK_SANDBOX="${SANDBOX_NAME:-$(hostname 2>/dev/null || echo sandbox)}"
+  SBX_NCTALK_PROJECT="$(basename "${prjpath:-project}")"
+
+  local hooks_dir="$HOME/.claude/hooks"
+  mkdir -p "$hooks_dir"
+
+  # The hook script is staged next to this script by docker-sbx-create-sandbox.py.
+  local stage="$HOME/nctalk-notify.sh"
+  if [[ ! -f "$stage" ]]; then
+    echo "Warning: $stage not found, skipping Nextcloud Talk hook"
+    return 0
+  fi
+  mv -f "$stage" "$hooks_dir/nctalk-notify.sh"
+  chmod 755 "$hooks_dir/nctalk-notify.sh"
+
+  if ! write_notify_env SBX_NCTALK "$hooks_dir/nctalk.env" "$events" \
+       "URL USER TOKEN ROOM PREFIX DRYRUN" "ROOM"; then
+    echo "Warning: could not write $hooks_dir/nctalk.env, skipping Nextcloud Talk hook"
+    return 0
+  fi
+
+  if ! wire_notify_hooks "$hooks_dir/nctalk-notify.sh" "$events"; then
+    return 0
+  fi
+
+  echo "Nextcloud Talk notifications enabled for: $events"
 }
 
 update_claude_code_settings() {
@@ -352,5 +436,6 @@ load_env_file
 install_tools
 update_claude_code_settings
 install_slack_hook
+install_nctalk_hook
 cleanup_env_file
 setup_env

@@ -11,6 +11,8 @@ Tested on :
 
   - Ubuntu 26.04 LTS
 
+  - Windows 11
+
 Host scripts (install / create / update / test) live in the repository root and must be run
 from that directory. Scripts that run **inside** a sandbox live in `sandbox/`; they are staged
 in automatically by `docker-sbx-create-sandbox.py` and are not run on the host.
@@ -22,27 +24,57 @@ This must be done only once.
 
 First [create a docker account](https://app.docker.com/signup/) if you do not have one already or if you want one for this installation.
 
-The cross-platform installer (Linux, WSL, macOS, Windows) needs Python 3.9+:
+The cross-platform installer is `docker-sbx-install.py` (Python 3.9+, standard library only). It
+runs on Linux, WSL2, macOS and Windows, and whichever platform you are on it installs or updates
+Docker, installs the `sbx` CLI, signs you in (at one point you will need your docker account),
+sets the global network policy, and persists the environment variables. Add `--dry-run` to print
+every command without changing anything; it needs no special privilege on any platform.
 
-    sudo python3 docker-sbx-install.py     # Linux / WSL
-    python3 docker-sbx-install.py          # macOS
-    python  docker-sbx-install.py          # Windows, as a regular user
+At the end of installation, all network communication from the sandboxes is prohibited, except for system updates.
 
-Add `--dry-run` to print every command without changing anything. The script installs or
-updates Docker, installs the `sbx` CLI, signs you in (at one point you will need your docker
-account), sets the global network policy, and persists the environment variables.
+### Linux (including WSL2)
 
-`--dry-run` needs no special privilege on any platform. On Windows neither does the install:
-Docker Desktop's and `sbx`'s installers raise their own UAC prompt when they need one. The
-only step that requires an elevated terminal is enabling the **Windows Hypervisor Platform**,
-which local sandboxes need — `Enable-WindowsOptionalFeature` cannot prompt for itself. The
-script reads that feature's state first and asks you to run one command as administrator only
-when it is actually off. (Docker Desktop has no need for this feature and does not enable it.)
+Run it with `sudo` — the Linux path installs system packages and Docker itself:
 
-**Windows Hypervisor Platform is its own feature.** It is *not* Hyper-V, and *not* the Virtual
-Machine Platform that WSL 2 uses — having either of those does not turn it on, so a machine
-that "already has the hypervisor" can still need this step. To check and enable it yourself, in
-an **elevated** PowerShell:
+    sudo python3 docker-sbx-install.py
+
+What is specific to Linux:
+
+- **Docker Engine**, not Docker Desktop, is installed from Docker's own `apt` repository, together
+  with the `docker-sbx` package, `util-linux-extra` and `python3-yaml`.
+- The invoking user is added to the **`kvm` group**, which local sandboxes need for hardware
+  virtualization. Group membership only applies to new sessions, so for the commands that run
+  during installation the script re-enters the session through `sg kvm`; your own shells pick it
+  up the next time you log in.
+- **WSL2** is detected and handled as Linux, so the `sudo` invocation and the `kvm` group are the
+  same as above. Two things to keep in mind there: a Windows-side project is reached under
+  `/mnt/c/...` rather than a native path, and the sandbox relies on WSL2's nested virtualization
+  for KVM.
+
+### Windows
+
+Run it from a **regular user** terminal; no elevated prompt is needed:
+
+    python  docker-sbx-install.py
+
+What is specific to Windows:
+
+- Tested on **Windows 11**.
+- The installer uses **`winget`** for both Docker Desktop (`Docker.DockerDesktop`) and the `sbx`
+  CLI (`Docker.sbx`), so a healthy winget is a prerequisite — see the troubleshooting below.
+- **Docker Desktop needs WSL2 or Hyper-V enabled**, and a reboot afterwards.
+- Docker Desktop's and `sbx`'s own installers raise their own **UAC** prompt when they need one, so
+  the install itself never needs an elevated terminal. The one step that does is enabling the
+  **Windows Hypervisor Platform** below.
+- A Windows `C:\...` project path is visible inside the sandbox as `/c/...`.
+
+**Windows Hypervisor Platform** is needed by **local** sandboxes (cloud sandboxes do not need it).
+It is *not* Hyper-V, and *not* the Virtual Machine Platform that WSL 2 uses — having either of those
+does not turn it on, so a machine that "already has the hypervisor" can still need this step.
+`Enable-WindowsOptionalFeature` cannot prompt for itself, so this is the one step that requires an
+elevated terminal; the installer reads the feature's state first and asks you to run one command as
+administrator only when it is actually off. (Docker Desktop has no need for this feature and does
+not enable it.) To check and enable it yourself, in an **elevated** PowerShell:
 
 ```powershell
 (Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform).State
@@ -50,7 +82,7 @@ Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform -All
 ```
 
 Restart Windows if prompted. `EnablePending` in the first command's output means it is on but
-waiting for that restart. Only **local** sandboxes need this; cloud sandboxes do not.
+waiting for that restart.
 
 Reading the state needs administrator rights too — for a standard user
 `Get-WindowsOptionalFeature -Online` fails with *Access is denied*, which makes an enabled
@@ -58,9 +90,7 @@ feature look missing. The script therefore reads it through `Win32_OptionalFeatu
 standard users can query, and it will not block the install if that read fails: it warns and
 tells you how to check by hand instead.
 
-At the end of installation, all network communication from the sandboxes is prohibited, except for system updates
-
-### Windows: winget fails with `0x8a15000f`
+#### Windows: winget fails with `0x8a15000f`
 
 On Windows the installer uses `winget` both for Docker Desktop and for the `sbx` CLI. If
 `winget` itself is unhealthy you get, right after answering `y` to the Docker Desktop prompt:
@@ -98,6 +128,20 @@ terminal it detects the existing Docker and skips the winget step.
 
 Get winget healthy **before** re-running the whole script: the `sbx` CLI is installed through the
 same source, so it fails with the identical error a few steps later.
+
+### macOS
+
+Run it as a **regular user** — Homebrew refuses to run as root:
+
+    python3 docker-sbx-install.py
+
+What is specific to macOS:
+
+- **Homebrew is required.** Docker Desktop is installed with `brew install --cask docker`, and the
+  `sbx` CLI with `brew trust docker/tap` followed by `brew install docker/tap/sbx`.
+- There is no native Docker Engine on macOS, so **Docker Desktop provides the `docker` daemon**; it
+  is needed both for local sandboxes and for the host-side secret scan (gitleaks runs in a
+  container, see [Create a sandbox](#create-a-sandbox)).
 
 
 ## Create a sandbox
@@ -282,18 +326,28 @@ python3 docker-sbx-create-sandbox.py -n fullstack -p "$HOME/projects/fullstack" 
 ```
 
 
-## Slack notifications (optional)
+## Notifications (optional)
 
 A sandbox can tell you what its Claude Code is doing without you having to attach to it.
-When the env file passed with `-e` enables it, the sandbox gets Claude Code hooks that
-post one short line per lifecycle event:
+Two providers are supported — **Slack** and **Nextcloud Talk** — and each is switched on
+independently, so a sandbox can notify over Slack only, over Talk only, or over both at the
+same time. When the env file passed with `-e` enables one, the sandbox gets Claude Code
+hooks that post one short line per lifecycle event:
 
 ```
 [test01] test01 — Claude Code is done
 ```
 
-It is off unless asked for: with no `SBX_SLACK_*` variables in the env file, nothing is
-written and the sandbox behaves exactly as before.
+Both are off unless asked for: with no `SBX_SLACK_*` and no `SBX_NCTALK_*` variables in the
+env file, nothing is written and the sandbox behaves exactly as before. The two providers
+share the same event vocabulary (`Stop`, `Notification`, `SessionStart`, `SessionEnd`,
+`SubagentStop`, `UserPromptSubmit`), the same default set
+(`Stop,Notification,SessionStart,SessionEnd`), the same per-event override scheme, and the
+same message format. Enabling one never affects the other.
+
+## Slack notifications (optional)
+
+Set `SBX_SLACK_ENABLED=true` to notify a Slack channel.
 
 ### Before you start: a Slack app and a dedicated channel
 
@@ -365,7 +419,7 @@ python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -e $HOME
 | `SBX_SLACK_CHANNEL` | – | Default channel **id** for the bot-token mode — not a name. See [Getting the channel id](#getting-the-channel-id). |
 | `SBX_SLACK_EVENTS` | `Stop,Notification,SessionStart,SessionEnd` | Which events to notify on. `SubagentStop` and `UserPromptSubmit` are also accepted. |
 | `SBX_SLACK_PREFIX` | – | Extra text prepended to every message. |
-| `SBX_SLACK_DRYRUN` | `false` | Print the resolved message instead of posting it. |
+| `SBX_SLACK_DRYRUN` | `false` | Print the resolved message to stderr instead of posting it. |
 
 If both credential styles are configured, the bot token wins. Any webhook or channel
 variable can be redirected for a single event by appending the upper-cased event name —
@@ -433,6 +487,8 @@ curl -s -H "Authorization: Bearer $SBX_SLACK_BOT_TOKEN" \
   option; a bot token can post to every channel the bot belongs to.
 - Network policy is extended **per sandbox** with only the endpoint that credential style
   needs: `hooks.slack.com` for webhooks, `slack.com` for a bot token. Nothing global changes.
+- Bot tokens and secret webhook URLs are supplied to curl through its stdin configuration,
+  keeping them out of the process argument list.
 - Every hook exits `0` and never writes to stdout, so a Slack outage cannot block or
   derail the agent. A failed post therefore cannot interrupt you, but it is **not** silent:
   the reason is appended to `~/.claude/hooks/slack-errors.log` (mode `600`, one line per
@@ -440,9 +496,91 @@ curl -s -H "Authorization: Bearer $SBX_SLACK_BOT_TOKEN" \
   it distinguishes a webhook Slack rejected, a bot that was not invited to the channel
   (`not_in_channel`), a bad token (`invalid_auth`), and a request the sandbox's network
   policy dropped (HTTP `403`). The webhook path is redacted, since it is the credential.
-  `SBX_SLACK_DRYRUN=true` still resolves and prints the message without posting.
+  `SBX_SLACK_DRYRUN=true` still resolves and prints the message to stderr without posting.
 - The env file is read as-is, so a CRLF file is fine: the sandbox strips the carriage
   return, exactly as the host side already did.
+
+
+## Nextcloud Talk notifications (optional)
+
+Set `SBX_NCTALK_ENABLED=true` to notify a Nextcloud Talk room instead of (or as well as)
+Slack. It posts through the Talk **spreed** API using a Nextcloud user's app password, so
+nothing is provisioned for you: the user, the credential and the room must already exist.
+
+### Getting a credential
+
+1. **A Nextcloud user** that is a member of the room you want the messages in. A dedicated
+   account is least privilege: the app password you place in the sandbox can act as that
+   user for every API call, so scope it to an account you are willing to expose there.
+2. **An app password** for that user: in Nextcloud, **Settings → Security → Devices &
+   sessions → Create new app password**. Copy the generated password — it is shown once.
+   Your normal login password will not work with the API.
+3. **The room token** of the Talk conversation. Open the room and read it from the URL:
+   in `https://cloud.example.com/call/abc123XYZ`, the token is `abc123XYZ`. The room must
+   be one the user is a member of.
+
+### Setup
+
+Write an env file (for example `$HOME/private/.nctalk.env`):
+
+```
+SBX_NCTALK_ENABLED=true
+SBX_NCTALK_URL=https://cloud.example.com
+SBX_NCTALK_USER=agent
+SBX_NCTALK_TOKEN=xxxxx-xxxxx-xxxxx-xxxxx-xxxxx
+SBX_NCTALK_ROOM=abc123XYZ
+```
+
+and pass it like any other env file:
+
+```
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -e $HOME/private/.nctalk.env
+```
+
+### Variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SBX_NCTALK_ENABLED` | `false` | Master switch. Anything other than `true` leaves the sandbox untouched. |
+| `SBX_NCTALK_URL` | – | Base URL of the Nextcloud instance (scheme + host; a trailing slash is fine). |
+| `SBX_NCTALK_USER` | – | Nextcloud user id the app password belongs to. |
+| `SBX_NCTALK_TOKEN` | – | App password for that user. |
+| `SBX_NCTALK_ROOM` | – | Talk room token (see above). |
+| `SBX_NCTALK_EVENTS` | `Stop,Notification,SessionStart,SessionEnd` | Which events to notify on. `SubagentStop` and `UserPromptSubmit` are also accepted. |
+| `SBX_NCTALK_PREFIX` | – | Extra text prepended to every message. |
+| `SBX_NCTALK_DRYRUN` | `false` | Print the resolved message to stderr instead of posting it. |
+
+All four of `SBX_NCTALK_URL`, `SBX_NCTALK_USER`, `SBX_NCTALK_TOKEN` and `SBX_NCTALK_ROOM`
+are required when the feature is enabled; creation aborts with the missing variable named
+otherwise. The room can be redirected for a single event by appending the upper-cased event
+name — `SBX_NCTALK_ROOM_NOTIFICATION=…`, for instance, sends `Notification` messages to a
+different room.
+
+The message format is the same as Slack's: `[<sandbox>] <project> — <phrase>`, with Claude
+Code's own reason appended on a second line for `Notification` events. Unlike Slack, a
+Nextcloud Talk message is Markdown with no link/mention entity, so the text is sent verbatim
+rather than HTML-escaped.
+
+### How it is wired, and what it costs you
+
+- A hook script is installed at `~/.claude/hooks/nctalk-notify.sh` inside the sandbox, and
+  `hooks` entries for the chosen events are merged into `~/.claude/settings.json` alongside
+  any Slack entries. Existing hooks are preserved, and re-running setup replaces rather than
+  duplicates its own entries, per provider.
+- The credential lives in `~/.claude/hooks/nctalk.env`, mode `600`, outside the project
+  volume and separate from `slack.env`. It is still readable by the agent running in that
+  sandbox, so scope the app password accordingly.
+- Network policy is extended **per sandbox** with the Nextcloud instance's host only.
+  Nothing global changes.
+- Every hook exits `0` and never writes to stdout, so an outage cannot block or derail the
+  agent. A failed post is **not** silent: the reason — the OCS status, the room and the
+  response body — is appended to `~/.claude/hooks/nctalk-errors.log` (mode `600`, one line
+  per failure, created only when something fails). Check it first if a message never
+  arrives. `SBX_NCTALK_DRYRUN=true` still resolves and prints the message to stderr without posting.
+- The endpoint used is
+  `<SBX_NCTALK_URL>/ocs/v2.php/apps/spreed/api/v1/chat/<room>`, with the app password sent
+  as HTTP basic auth through curl's stdin configuration rather than its process arguments,
+  and with the `OCS-APIRequest: true` header Nextcloud requires.
 
 
 ## Use a sandbox

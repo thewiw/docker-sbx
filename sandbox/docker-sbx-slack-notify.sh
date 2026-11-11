@@ -70,6 +70,25 @@ log_safe_url() {
   printf '%s' "$1" | sed -E 's|(https?://[^/]+).*|\1/...|'
 }
 
+# Quote a value for curl's config syntax. Credentials are fed to curl on stdin,
+# so neither a bot token nor a secret webhook path appears in its argument list.
+curl_config_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\n'/\\n}"
+  printf '%s' "$value"
+}
+
+curl_request_config() {
+  local url="$1" token="${2:-}"
+  printf 'url = "%s"\n' "$(curl_config_escape "$url")"
+  if [[ -n "$token" ]]; then
+    printf 'header = "%s"\n' "$(curl_config_escape "Authorization: Bearer $token")"
+  fi
+}
+
 # One POST. Leaves the HTTP status in SLACK_STATUS and the single-lined response
 # body in SLACK_BODY, which the caller inspects: Slack reports API errors such as
 # not_in_channel or invalid_auth as HTTP 200, so the body is authoritative and the
@@ -81,21 +100,24 @@ log_safe_url() {
 # application/x-www-form-urlencoded, and Slack, told to expect form data but handed
 # a JSON body, answers HTTP 200 {"ok":false,"error":"invalid_form_data"}.
 post_request() {
-  local url="$1" body="$2"
-  shift 2
+  local url="$1" body="$2" token="${3:-}"
   local tmp
   tmp="$(mktemp "${TMPDIR:-/tmp}/sbx-slack-resp.XXXXXX" 2>/dev/null)" || tmp=""
   if [[ -z "$tmp" ]]; then
-    curl --silent --max-time 5 --output /dev/null \
+    curl_request_config "$url" "$token" | curl --silent --max-time 5 --output /dev/null \
+      --config - \
       -H 'Content-type: application/json; charset=utf-8' \
-      "$@" --data-binary "$body" "$url" >/dev/null 2>&1 || true
+      --data-binary "$body" >/dev/null 2>&1 || true
     SLACK_STATUS="000"
     SLACK_BODY="no temp file available for the response"
     return 0
   fi
-  SLACK_STATUS="$(curl --silent --max-time 5 --output "$tmp" --write-out '%{http_code}' \
-                    -H 'Content-type: application/json; charset=utf-8' \
-                    "$@" --data-binary "$body" "$url" 2>/dev/null)" || SLACK_STATUS="000"
+  SLACK_STATUS="$(
+    curl_request_config "$url" "$token" | curl --silent --max-time 5 --output "$tmp" \
+      --write-out '%{http_code}' --config - \
+      -H 'Content-type: application/json; charset=utf-8' \
+      --data-binary "$body" 2>/dev/null
+  )" || SLACK_STATUS="000"
   SLACK_BODY="$(cat "$tmp" 2>/dev/null || true)"
   rm -f "$tmp"
   SLACK_STATUS="${SLACK_STATUS:-000}"
@@ -162,12 +184,12 @@ notify() {
   local token="${SBX_SLACK_BOT_TOKEN:-}"
 
   if [[ "${SBX_SLACK_DRYRUN:-false}" == "true" ]]; then
-    # Resolve everything and log it, but do not post: lets the configuration be
-    # checked without spamming a real channel.
+    # Resolve everything and report it on stderr, preserving the no-stdout hook
+    # contract, but do not post or spam a real channel.
     if [[ -n "$token" ]]; then
-      printf '%s\tevent=%s\tchannel=%s\ttext=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$event" "$channel" "$text"
+      printf '%s\tevent=%s\tchannel=%s\ttext=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$event" "$channel" "$text" >&2
     else
-      printf '%s\tevent=%s\turl=%s\ttext=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$event" "$url" "$text"
+      printf '%s\tevent=%s\turl=%s\ttext=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$event" "$url" "$text" >&2
     fi
     return 0
   fi
@@ -175,13 +197,12 @@ notify() {
   local body
   # Prefer the bot token when both forms are configured.
   if [[ -n "$token" && -n "$channel" ]]; then
-    # The token travels as a header, so it is briefly visible in `ps` to the same
-    # user that can already read slack.env; nothing new is exposed by this.
+    # The token travels through curl's stdin configuration, not its argument list.
     body="$(jq -nc --arg c "$channel" --arg t "$text" '{channel:$c,text:$t}' 2>/dev/null)" || {
       log_failure "event=$event bot token mode: could not build the body (is jq installed?)"
       return 0
     }
-    post_request https://slack.com/api/chat.postMessage "$body" -H "Authorization: Bearer $token"
+    post_request https://slack.com/api/chat.postMessage "$body" "$token"
     if [[ "$SLACK_STATUS" != 2* ]]; then
       log_failure "event=$event bot token mode: chat.postMessage returned HTTP $SLACK_STATUS for channel='$channel' - $(log_body)"
     elif [[ "$(printf '%s' "$SLACK_BODY" | jq -r '.ok // false' 2>/dev/null)" != "true" ]]; then

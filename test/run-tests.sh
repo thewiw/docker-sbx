@@ -48,9 +48,11 @@ pass() { echo "  [PASS] $1"; ((PASSED++)) || true; }
 fail() { echo "  [FAIL] $1"; ((FAILED++)) || true; }
 
 cleanup() {
-  if [[ -n "${SINKPID:-}" ]]; then
-    kill "$SINKPID" 2>/dev/null || true
-  fi
+  for pid in "${SINKPID:-}" "${NCTPID:-}"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
   rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
@@ -624,17 +626,21 @@ out=""; args=("$@")
 for ((i=0;i<${#args[@]};i++)); do
   case "${args[i]}" in --output) out="${args[i+1]}" ;; esac
 done
+config="$(cat)"
 [[ -n "${STUB_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_ARGS_LOG"
+[[ -n "${STUB_CONFIG_LOG:-}" ]] && printf '%s\n' "$config" >> "$STUB_CONFIG_LOG"
 [[ -n "$out" ]] && printf '%s' "${STUB_BODY:-ok}" > "$out"
 printf '%s' "${STUB_STATUS:-200}"
 SCRIPT
 chmod +x "$STUB_BIN2/curl"
 LOG="$HOOKLOG_HOME/slack-errors.log"
 ARGSLOG="$HOOKLOG_HOME/curl-args.txt"
+CONFIGLOG="$HOOKLOG_HOME/curl-config.txt"
 : > "$ARGSLOG"
+: > "$CONFIGLOG"
 HOOK_RC=0
 fire_hook() {
-  PATH="$STUB_BIN2:$PATH" STUB_STATUS="$1" STUB_BODY="$2" STUB_ARGS_LOG="$ARGSLOG" \
+  PATH="$STUB_BIN2:$PATH" STUB_STATUS="$1" STUB_BODY="$2" STUB_ARGS_LOG="$ARGSLOG" STUB_CONFIG_LOG="$CONFIGLOG" \
     bash -c "printf '%s' '{\"hook_event_name\":\"Stop\"}' | '$HOOKLOG_HOME/slack-notify.sh'" 2>/dev/null || HOOK_RC=$?
 }
 
@@ -654,13 +660,19 @@ else
   fail "Hook wrote to stdout: $SUCCESS_OUT"
 fi
 # The token branch posts to slack.com, so its request cannot be observed at a local
-# sink; the stub records the argv instead. Slack answers a JSON body sent as
-# x-www-form-urlencoded with invalid_form_data, so this must be asserted here too.
+# sink; the stub records argv and the curl config received on stdin instead. Slack
+# answers a JSON body sent as x-www-form-urlencoded with invalid_form_data, so the
+# content type must be asserted here too.
 if tail -1 "$ARGSLOG" | grep -q "Content-type: application/json" \
-   && tail -1 "$ARGSLOG" | grep -q "Authorization: Bearer xoxb-t"; then
+   && grep -qF 'header = "Authorization: Bearer xoxb-t"' "$CONFIGLOG"; then
   pass "Token mode sends JSON content type and the bearer token"
 else
-  fail "Token mode request is malformed: $(tail -1 "$ARGSLOG")"
+  fail "Token mode request is malformed: $(tail -1 "$ARGSLOG") / $(tail -2 "$CONFIGLOG")"
+fi
+if grep -q 'xoxb-t' "$ARGSLOG"; then
+  fail "The Slack bot token was exposed in curl's arguments"
+else
+  pass "The Slack bot token stays out of curl's arguments"
 fi
 
 # Slack answers API errors with HTTP 200, so the body is the only signal.
@@ -705,6 +717,13 @@ if tail -1 "$LOG" | grep -q "SECRETPATH"; then
   fail "The webhook secret was written to the log"
 else
   pass "The webhook path is redacted in the log"
+fi
+if grep -q 'SECRETPATH' "$ARGSLOG"; then
+  fail "The webhook secret was exposed in curl's arguments"
+elif grep -qF 'url = "https://hooks.slack.com/services/T0/B0/SECRETPATH"' "$CONFIGLOG"; then
+  pass "The secret webhook URL reaches curl through stdin, not argv"
+else
+  fail "The webhook URL was missing from curl's stdin configuration"
 fi
 if [[ "$(stat -c '%a' "$LOG" 2>/dev/null)" == "600" ]]; then
   pass "The error log is mode 600"
@@ -753,6 +772,306 @@ if [[ "$(merge_env CLAUDE_CODE_ATTRIBUTION_HEADER)" == "0" ]]; then
   pass "Passes a supplied CLAUDE_CODE_ATTRIBUTION_HEADER through"
 else
   fail "A supplied CLAUDE_CODE_ATTRIBUTION_HEADER was dropped"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 20: host side allows the Nextcloud Talk instance's host
+# ----------------------------------------------------------------------
+echo "TEST 20: host side allows the Nextcloud Talk host"
+nctalk_hosts_for() {
+  # Mirror hosts_for(), driving update_sbx_policy_nctalk() instead.
+  PATH="$STUB_BIN:$PATH" python3 - "$SCRIPT" "$1" 2>&1 <<'PY' \
+    | grep -o 'allowing .*' | sed 's/allowing //' | paste -sd, - || true
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("create_sbx", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.CONFIG.name = "probe"
+module.CONFIG.envfile = sys.argv[2]
+module.update_sbx_policy_nctalk()
+PY
+}
+NC_CASE_ENV="$TMPDIR/nctalk-hosts.env"
+printf 'SBX_NCTALK_ENABLED=true\nSBX_NCTALK_URL=https://cloud.example.com\nSBX_NCTALK_USER=a\nSBX_NCTALK_TOKEN=t\nSBX_NCTALK_ROOM=r\n' > "$NC_CASE_ENV"
+if [[ "$(nctalk_hosts_for "$NC_CASE_ENV")" == "cloud.example.com" ]]; then
+  pass "The Talk instance host is allowed"
+else
+  fail "Talk mode allowed '$(nctalk_hosts_for "$NC_CASE_ENV")'"
+fi
+printf 'SBX_NCTALK_ENABLED=false\nSBX_NCTALK_URL=https://cloud.example.com\n' > "$NC_CASE_ENV"
+if [[ -z "$(nctalk_hosts_for "$NC_CASE_ENV")" ]]; then
+  pass "Disabled Talk adds no policy rule at all"
+else
+  fail "Disabled Talk still added '$(nctalk_hosts_for "$NC_CASE_ENV")'"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 21: the in-sandbox Talk installer writes nctalk.env and wires hooks
+# ----------------------------------------------------------------------
+echo "TEST 21: the Talk installer writes its config and wires hooks"
+NCT_HOME="$TMPDIR/nctalk-home"
+mkdir -p "$NCT_HOME/.claude"
+printf '{"model":"keepme"}\n' > "$NCT_HOME/.claude/settings.json"
+cp "$SCRIPTS_DIR/sandbox/docker-sbx-nctalk-notify.sh" "$NCT_HOME/nctalk-notify.sh"
+HOME="$NCT_HOME" SANDBOX_NAME=nc-420 SBX_NCTALK_ENABLED=true \
+  SBX_NCTALK_URL='https://cloud.example.com' SBX_NCTALK_USER='agent' \
+  SBX_NCTALK_TOKEN='app-pw' SBX_NCTALK_ROOM='roomtoken' \
+  bash -c "source '$INSTALLER_FNS'; prjpath=/mnt/c/Projects/ncproj; install_nctalk_hook" >/dev/null 2>&1 || true
+if [[ "$(jq -r '[.hooks|keys[]]|sort|join(",")' "$NCT_HOME/.claude/settings.json" 2>/dev/null)" == "Notification,SessionEnd,SessionStart,Stop" ]]; then
+  pass "Wires the four default lifecycle events for Talk"
+else
+  fail "Unexpected events: $(jq -c '.hooks|keys' "$NCT_HOME/.claude/settings.json" 2>/dev/null)"
+fi
+if [[ "$(stat -c '%a' "$NCT_HOME/.claude/hooks/nctalk.env" 2>/dev/null)" == "600" ]]; then
+  pass "nctalk.env is mode 600"
+else
+  fail "nctalk.env perms are $(stat -c '%a' "$NCT_HOME/.claude/hooks/nctalk.env" 2>/dev/null || echo missing)"
+fi
+if grep -q "SBX_NCTALK_ROOM='roomtoken'" "$NCT_HOME/.claude/hooks/nctalk.env" 2>/dev/null \
+   && grep -q "SBX_NCTALK_URL='https://cloud.example.com'" "$NCT_HOME/.claude/hooks/nctalk.env" 2>/dev/null; then
+  pass "nctalk.env carries the target under the SBX_NCTALK_ prefix"
+else
+  fail "nctalk.env is missing its target: $(cat "$NCT_HOME/.claude/hooks/nctalk.env" 2>/dev/null || echo none)"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 22: the Talk hook posts to an endpoint with the OCS contract
+# ----------------------------------------------------------------------
+echo "TEST 22: the Talk hook posts to an endpoint with the OCS contract"
+NCHOOK="$TMPDIR/nchook"
+mkdir -p "$NCHOOK"
+cp "$SCRIPTS_DIR/sandbox/docker-sbx-nctalk-notify.sh" "$NCHOOK/nctalk-notify.sh"
+chmod 755 "$NCHOOK/nctalk-notify.sh"
+NCTLOG="$TMPDIR/nct-sink.jsonl"
+NCTMETA="$TMPDIR/nct-meta.jsonl"
+: > "$NCTLOG"
+: > "$NCTMETA"
+NCTPORT=$((21000 + RANDOM % 20000))
+# A sink that records the body plus the request line and headers, so the path, the
+# OCS-APIRequest header and the basic-auth credential can all be asserted.
+cat > "$TMPDIR/nct-sink.py" << 'PY'
+import http.server, json, sys
+out, meta = sys.argv[2], sys.argv[3]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(n).decode()
+        with open(out, 'a') as f:
+            f.write(body + '\n')
+        with open(meta, 'a') as f:
+            f.write(json.dumps({
+                'path': self.path,
+                'content_type': self.headers.get('Content-Type') or '',
+                'ocs': self.headers.get('OCS-APIRequest') or '',
+                'authorization': self.headers.get('Authorization') or '',
+            }) + '\n')
+        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+    def log_message(self, *a): pass
+http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+PY
+python3 "$TMPDIR/nct-sink.py" "$NCTPORT" "$NCTLOG" "$NCTMETA" &
+NCTPID=$!
+sleep 1
+printf "SBX_NCTALK_SANDBOX='nc-420'\nSBX_NCTALK_PROJECT='ncproj'\nSBX_NCTALK_URL='http://127.0.0.1:%s'\nSBX_NCTALK_USER='agent'\nSBX_NCTALK_TOKEN='app-pw'\nSBX_NCTALK_ROOM='roomtoken'\n" "$NCTPORT" > "$NCHOOK/nctalk.env"
+chmod 600 "$NCHOOK/nctalk.env"
+printf '%s' '{"hook_event_name":"Stop"}' | "$NCHOOK/nctalk-notify.sh" || true
+sleep 1
+if jq -e '.message | test("\\[nc-420\\] ncproj — Claude Code is done")' "$NCTLOG" >/dev/null 2>&1; then
+  pass "Delivered the expected Talk message text over the wire"
+else
+  fail "No matching Talk POST arrived (got: $(cat "$NCTLOG" 2>/dev/null || echo none))"
+fi
+if tail -1 "$NCTMETA" | jq -re '.path | endswith("/ocs/v2.php/apps/spreed/api/v1/chat/roomtoken")' >/dev/null 2>&1; then
+  pass "Posts to the spreed chat endpoint for the configured room"
+else
+  fail "Unexpected Talk path: $(tail -1 "$NCTMETA" 2>/dev/null)"
+fi
+if tail -1 "$NCTMETA" | jq -re '.ocs == "true" and (.content_type | startswith("application/json"))' >/dev/null 2>&1; then
+  pass "Talk POST declares OCS-APIRequest and application/json"
+else
+  fail "Wrong Talk headers: $(tail -1 "$NCTMETA" 2>/dev/null)"
+fi
+if tail -1 "$NCTMETA" | jq -re '.authorization | startswith("Basic ")' >/dev/null 2>&1; then
+  pass "Talk POST carries the app password as basic auth"
+else
+  fail "Missing basic-auth credential: $(tail -1 "$NCTMETA" 2>/dev/null)"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 23: Slack and Nextcloud Talk can be enabled together
+# ----------------------------------------------------------------------
+echo "TEST 23: Slack and Talk can be enabled together"
+BOTH_HOME="$TMPDIR/bothhome"
+mkdir -p "$BOTH_HOME/.claude"
+printf '{}\n' > "$BOTH_HOME/.claude/settings.json"
+run_both() {
+  cp "$SCRIPTS_DIR/sandbox/docker-sbx-slack-notify.sh" "$BOTH_HOME/slack-notify.sh"
+  cp "$SCRIPTS_DIR/sandbox/docker-sbx-nctalk-notify.sh" "$BOTH_HOME/nctalk-notify.sh"
+  HOME="$BOTH_HOME" SANDBOX_NAME=both SBX_SLACK_ENABLED=true \
+    SBX_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/T/B/x' \
+    SBX_NCTALK_ENABLED=true SBX_NCTALK_URL='https://cloud.example.com' \
+    SBX_NCTALK_USER='agent' SBX_NCTALK_TOKEN='app-pw' SBX_NCTALK_ROOM='roomtoken' \
+    bash -c "source '$INSTALLER_FNS'; prjpath=/mnt/c/Projects/both; install_slack_hook; install_nctalk_hook" >/dev/null 2>&1 || true
+}
+per_event_commands() {
+  jq -r '[.hooks[] | [.[].hooks[].command] | length] | unique | join(",")' \
+    "$BOTH_HOME/.claude/settings.json" 2>/dev/null || echo err
+}
+run_both
+if [[ "$(per_event_commands)" == "2" ]]; then
+  pass "Every event carries one hook entry per provider"
+else
+  fail "Unexpected hooks per event: $(jq -c '.hooks' "$BOTH_HOME/.claude/settings.json" 2>/dev/null)"
+fi
+if jq -e '[.hooks[][] | .hooks[].command] | (any(endswith("slack-notify.sh"))) and (any(endswith("nctalk-notify.sh")))' \
+     "$BOTH_HOME/.claude/settings.json" >/dev/null 2>&1; then
+  pass "Both hook scripts are wired into settings.json"
+else
+  fail "One provider was lost: $(jq -c '.hooks' "$BOTH_HOME/.claude/settings.json" 2>/dev/null)"
+fi
+run_both
+if [[ "$(per_event_commands)" == "2" ]]; then
+  pass "Re-running setup with both providers stays idempotent"
+else
+  fail "Re-running duplicated hooks: $(jq -c '.hooks' "$BOTH_HOME/.claude/settings.json" 2>/dev/null)"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 24: a refused Talk post is recorded, a successful one is not
+# ----------------------------------------------------------------------
+echo "TEST 24: a refused Talk post is recorded, a successful one is not"
+NCLOG_HOME="$TMPDIR/nclog"
+mkdir -p "$NCLOG_HOME"
+cp "$SCRIPTS_DIR/sandbox/docker-sbx-nctalk-notify.sh" "$NCLOG_HOME/nctalk-notify.sh"
+chmod 755 "$NCLOG_HOME/nctalk-notify.sh"
+STUB_BIN3="$TMPDIR/stubbin3"
+mkdir -p "$STUB_BIN3"
+# Stand in for curl so the response can be dictated: the status on stdout (what
+# curl --write-out produces) and the body in the --output file.
+cat > "$STUB_BIN3/curl" << 'SCRIPT'
+#!/bin/bash
+out=""; args=("$@")
+for ((i=0;i<${#args[@]};i++)); do
+  case "${args[i]}" in --output) out="${args[i+1]}" ;; esac
+done
+config="$(cat)"
+[[ -n "${STUB_ARGS_LOG:-}" ]] && printf '%s\n' "$*" >> "$STUB_ARGS_LOG"
+[[ -n "${STUB_CONFIG_LOG:-}" ]] && printf '%s\n' "$config" >> "$STUB_CONFIG_LOG"
+[[ -n "$out" ]] && printf '%s' "${STUB_BODY:-ok}" > "$out"
+printf '%s' "${STUB_STATUS:-200}"
+SCRIPT
+chmod +x "$STUB_BIN3/curl"
+NCLOG="$NCLOG_HOME/nctalk-errors.log"
+NCARGSLOG="$NCLOG_HOME/curl-args.txt"
+NCCONFIGLOG="$NCLOG_HOME/curl-config.txt"
+: > "$NCARGSLOG"
+: > "$NCCONFIGLOG"
+fire_nctalk() {
+  PATH="$STUB_BIN3:$PATH" STUB_STATUS="$1" STUB_BODY="$2" \
+    STUB_ARGS_LOG="$NCARGSLOG" STUB_CONFIG_LOG="$NCCONFIGLOG" \
+    bash -c "printf '%s' '{\"hook_event_name\":\"Stop\"}' | '$NCLOG_HOME/nctalk-notify.sh'" 2>/dev/null || true
+}
+printf "SBX_NCTALK_SANDBOX='probe'\nSBX_NCTALK_PROJECT='proj'\nSBX_NCTALK_URL='https://cloud.example.com'\nSBX_NCTALK_USER='agent'\nSBX_NCTALK_TOKEN='app-pw'\nSBX_NCTALK_ROOM='roomtoken'\n" > "$NCLOG_HOME/nctalk.env"
+fire_nctalk 200 '{"ocs":{"meta":{"statuscode":200},"data":{}}}'
+if [[ ! -f "$NCLOG" ]]; then
+  pass "A successful Talk post writes no error log"
+else
+  fail "Success was logged: $(cat "$NCLOG")"
+fi
+if grep -q 'app-pw' "$NCARGSLOG"; then
+  fail "The Talk app password was exposed in curl's arguments"
+elif grep -qF 'user = "agent:app-pw"' "$NCCONFIGLOG"; then
+  pass "The Talk app password reaches curl through stdin, not argv"
+else
+  fail "The Talk basic-auth credential was missing from curl's stdin configuration"
+fi
+# A non-2xx OCS reply: the reason must be recorded, and the room named, since a
+# wrong room token and a policy-blocked request look alike otherwise.
+fire_nctalk 404 '{"ocs":{"meta":{"statuscode":404,"message":"room not found"}}}'
+if tail -1 "$NCLOG" | grep -q "404" && tail -1 "$NCLOG" | grep -q "room='roomtoken'"; then
+  pass "A refused Talk post is logged with the status and the room"
+else
+  fail "The Talk refusal was not logged: $(tail -1 "$NCLOG" 2>/dev/null)"
+fi
+if [[ "$(stat -c '%a' "$NCLOG" 2>/dev/null)" == "600" ]]; then
+  pass "The Talk error log is mode 600"
+else
+  fail "Talk log perms are $(stat -c '%a' "$NCLOG" 2>/dev/null || echo missing)"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 25: an invalid Nextcloud base URL aborts before sandbox creation
+# ----------------------------------------------------------------------
+echo "TEST 25: an invalid Nextcloud base URL aborts before sandbox creation"
+NC_BAD_URL_ENV="$TMPDIR/nctalk-bad-url.env"
+printf 'SBX_NCTALK_ENABLED=true\nSBX_NCTALK_URL=cloud.example.com\nSBX_NCTALK_USER=agent\nSBX_NCTALK_TOKEN=app-pw\nSBX_NCTALK_ROOM=roomtoken\n' > "$NC_BAD_URL_ENV"
+OUTPUT=$(python3 "$REPO_DIR/docker-sbx-create-sandbox.py" -n test -p /tmp -s false -e "$NC_BAD_URL_ENV" 2>&1 || true)
+if echo "$OUTPUT" | grep -q "SBX_NCTALK_URL must be an absolute http:// or https:// URL"; then
+  pass "A URL without an HTTP scheme is rejected with a clear message"
+else
+  fail "Did not report the invalid Talk URL: $OUTPUT"
+fi
+if python3 "$REPO_DIR/docker-sbx-create-sandbox.py" -n test -p /tmp -s false -e "$NC_BAD_URL_ENV" >/dev/null 2>&1; then
+  fail "Should have exited non-zero for an invalid Talk URL"
+else
+  pass "Exits non-zero before requiring sbx or creating anything"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 26: dry-run reports on stderr and never invokes curl
+# ----------------------------------------------------------------------
+echo "TEST 26: dry-run reports on stderr and never invokes curl"
+DRYRUN_ROOT="$TMPDIR/dryrun"
+DRYRUN_BIN="$DRYRUN_ROOT/bin"
+mkdir -p "$DRYRUN_BIN/slack" "$DRYRUN_BIN/nctalk"
+cat > "$DRYRUN_BIN/curl" << 'SCRIPT'
+#!/bin/bash
+cat >/dev/null
+printf 'called\n' >> "$DRY_CALLS"
+printf '200'
+SCRIPT
+chmod +x "$DRYRUN_BIN/curl"
+cp "$SCRIPTS_DIR/sandbox/docker-sbx-slack-notify.sh" "$DRYRUN_BIN/slack/slack-notify.sh"
+cp "$SCRIPTS_DIR/sandbox/docker-sbx-nctalk-notify.sh" "$DRYRUN_BIN/nctalk/nctalk-notify.sh"
+printf "SBX_SLACK_SANDBOX='probe'\nSBX_SLACK_PROJECT='proj'\nSBX_SLACK_WEBHOOK_URL='https://hooks.slack.com/services/T/B/x'\nSBX_SLACK_DRYRUN='true'\n" > "$DRYRUN_BIN/slack/slack.env"
+printf "SBX_NCTALK_SANDBOX='probe'\nSBX_NCTALK_PROJECT='proj'\nSBX_NCTALK_URL='https://cloud.example.com'\nSBX_NCTALK_USER='agent'\nSBX_NCTALK_TOKEN='app-pw'\nSBX_NCTALK_ROOM='roomtoken'\nSBX_NCTALK_DRYRUN='true'\n" > "$DRYRUN_BIN/nctalk/nctalk.env"
+: > "$DRYRUN_BIN/slack.calls"
+: > "$DRYRUN_BIN/nctalk.calls"
+printf '%s' '{"hook_event_name":"Stop"}' | PATH="$DRYRUN_BIN:$PATH" DRY_CALLS="$DRYRUN_BIN/slack.calls" \
+  "$DRYRUN_BIN/slack/slack-notify.sh" > "$DRYRUN_BIN/slack.out" 2> "$DRYRUN_BIN/slack.err"
+printf '%s' '{"hook_event_name":"Stop"}' | PATH="$DRYRUN_BIN:$PATH" DRY_CALLS="$DRYRUN_BIN/nctalk.calls" \
+  "$DRYRUN_BIN/nctalk/nctalk-notify.sh" > "$DRYRUN_BIN/nctalk.out" 2> "$DRYRUN_BIN/nctalk.err"
+if [[ ! -s "$DRYRUN_BIN/slack.out" ]]; then
+  pass "Slack dry-run leaves stdout empty"
+else
+  fail "Slack dry-run wrote stdout: $(cat "$DRYRUN_BIN/slack.out")"
+fi
+if grep -q 'Claude Code is done' "$DRYRUN_BIN/slack.err"; then
+  pass "Slack dry-run reports the resolved message on stderr"
+else
+  fail "Slack dry-run did not report its message: $(cat "$DRYRUN_BIN/slack.err")"
+fi
+if [[ ! -s "$DRYRUN_BIN/slack.calls" ]]; then
+  pass "Slack dry-run never invokes curl"
+else
+  fail "Slack dry-run invoked curl"
+fi
+if [[ ! -s "$DRYRUN_BIN/nctalk.out" ]]; then
+  pass "Talk dry-run leaves stdout empty"
+else
+  fail "Talk dry-run wrote stdout: $(cat "$DRYRUN_BIN/nctalk.out")"
+fi
+if grep -q 'Claude Code is done' "$DRYRUN_BIN/nctalk.err"; then
+  pass "Talk dry-run reports the resolved message on stderr"
+else
+  fail "Talk dry-run did not report its message: $(cat "$DRYRUN_BIN/nctalk.err")"
+fi
+if [[ ! -s "$DRYRUN_BIN/nctalk.calls" ]]; then
+  pass "Talk dry-run never invokes curl"
+else
+  fail "Talk dry-run invoked curl"
 fi
 
 # ----------------------------------------------------------------------
