@@ -86,13 +86,23 @@ DEFAULT_NCTALK_EVENTS = DEFAULT_SLACK_EVENTS
 # A profile may never imply a global policy - it is always per-sandbox.
 FORBIDDEN_PROFILE_KEYS = ("global", "default", "all_sandboxes", "sandbox_default")
 
+# The documented top-level keys. Anything else is refused rather than ignored: a
+# typo'd `policy:` used to be silently dropped, creating a sandbox with no rules.
+PROFILE_KEYS = ("name", "description", "policies")
+
+# A policy entry names a host, optionally wildcarded ("*.example.com"). Syntax
+# only: `sbx policy` remains the authority, but a URL or a path is never a domain.
+PROFILE_DOMAIN_RE = re.compile(r"^[A-Za-z0-9*](?:[A-Za-z0-9.*_-]*[A-Za-z0-9*])?$")
+
 # A profile directory carries an asset tree that mirrors the sandbox's ~/.claude.
 # These filenames name the profile definition itself and are never copied.
 PROFILE_DEFINITION_NAMES = ("profile.yaml", "profile.yml")
 
 # Files a profile may never install, because docker-sbx or Claude Code owns them.
-# The check is on the first path component, so a directory is covered too.
-AGENT_ASSET_DENY = ("settings.json", "settings.local.json", ".credentials.json")
+# The check is on the first path component, so a directory is covered too. `.git`
+# is refused at both levels: a bundle pointed at a checkout must not ship its
+# history into the agent's home or the shared project volume.
+AGENT_ASSET_DENY = ("settings.json", "settings.local.json", ".credentials.json", ".git")
 PROJECT_ASSET_DENY = (".credentials.json", ".git")
 
 # Safety rail against selecting a whole checkout by accident.
@@ -1554,38 +1564,86 @@ def parse_profile_minimal(text: str, where: str):
 
 
 def validate_profile(data, where: str):
-    """Reproduce the bash validation, returning (allowed, denied)."""
+    """Validate the documented profile schema, returning (allowed, denied).
+
+    Unknown keys are refused at every level rather than ignored. A silent drop is
+    the dangerous case: `policy:` (a typo for `policies:`) or `allow_domains:`
+    would otherwise produce a sandbox that looks configured but is not.
+    """
     if data is None:
         data = {}
     if not isinstance(data, dict):
         raise ProfileError(f"profile {where} must be a YAML mapping")
 
     for key in data:
+        if not isinstance(key, str):
+            raise ProfileError(f"profile {where} has a non-string top-level key")
         if key.lower() in FORBIDDEN_PROFILE_KEYS:
             raise ProfileError(f"profile {where} contains forbidden global key '{key}'")
+        if key not in PROFILE_KEYS:
+            raise ProfileError(
+                f"profile {where} has unknown top-level key '{key}' "
+                f"(allowed: {', '.join(PROFILE_KEYS)})"
+            )
 
-    policies = data.get("policies") or {}
+    for key in ("name", "description"):
+        value = data.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ProfileError(f"profile {where} '{key}' must be a string")
+
+    policies = data.get("policies")
+    if policies is None:
+        policies = {}
     if not isinstance(policies, dict):
         raise ProfileError(f"profile {where} 'policies' must be a mapping")
-    for section in policies:
+
+    network = None
+    for section, value in policies.items():
+        if not isinstance(section, str):
+            raise ProfileError(f"profile {where} has a non-string policy section key")
         if section.lower() != "network":
             raise ProfileError(
                 f"profile {where} has unsupported policy section '{section}' (only 'network' is supported)"
             )
+        network = value
 
-    network = policies.get("network") or {}
+    if network is None:
+        network = {}
     if not isinstance(network, dict):
         raise ProfileError(f"profile {where} 'policies.network' must be a mapping")
 
+    actions = {}
+    for action, value in network.items():
+        if not isinstance(action, str) or action.lower() not in ("allow", "deny"):
+            raise ProfileError(
+                f"profile {where} 'policies.network' has unknown key '{action}' "
+                "(allowed: allow, deny)"
+            )
+        actions[action.lower()] = value
+
     allowed, denied = [], []
     for action in ("allow", "deny"):
-        entries = network.get(action) or []
+        entries = actions.get(action)
+        if entries is None:
+            entries = []
         if not isinstance(entries, list):
             raise ProfileError(f"profile {where} 'policies.network.{action}' must be a list")
         for entry in entries:
-            if not isinstance(entry, str) or not entry.strip():
-                raise ProfileError(f"profile {where} 'policies.network.{action}' contains invalid entry")
-            (allowed if action == "allow" else denied).append(entry.strip())
+            if not isinstance(entry, str):
+                raise ProfileError(
+                    f"profile {where} 'policies.network.{action}' contains a non-string entry"
+                )
+            domain = entry.strip()
+            if not domain:
+                raise ProfileError(
+                    f"profile {where} 'policies.network.{action}' contains an empty entry"
+                )
+            if ".." in domain or not PROFILE_DOMAIN_RE.match(domain):
+                raise ProfileError(
+                    f"profile {where} 'policies.network.{action}' contains invalid domain "
+                    f"'{domain}' (expected a host such as example.com or *.example.com)"
+                )
+            (allowed if action == "allow" else denied).append(domain)
     return allowed, denied
 
 

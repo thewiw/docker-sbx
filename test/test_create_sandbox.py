@@ -902,12 +902,59 @@ class ProfileParserTests(unittest.TestCase):
             "block scalar": "description: |\n  multi\n",
             "tab indent": "policies:\n\tnetwork:\n",
             "not a mapping": "- just\n- a list\n",
+            "unknown top-level key": "policy:\n  network:\n    allow:\n      - pypi.org\n",
+            "unknown network key": (
+                "policies:\n  network:\n    allow_domains:\n      - pypi.org\n"
+            ),
+            "url instead of domain": (
+                "policies:\n  network:\n    allow:\n      - https://pypi.org\n"
+            ),
+            "domain with a path": "policies:\n  network:\n    allow:\n      - pypi.org/simple\n",
+            "domain with a space": 'policies:\n  network:\n    allow:\n      - "bad host"\n',
+            "domain with a double dot": "policies:\n  network:\n    allow:\n      - a..b\n",
+            "name is not a string": "name:\n  x: y\n",
         }
         for label, text in cases.items():
             with self.subTest(case=label):
                 with self.assertRaises(cs.ProfileError):
                     data = cs.parse_profile_minimal(text, "t")
                     cs.validate_profile(data, "t")
+
+    def test_unknown_or_mistyped_mappings_are_rejected(self):
+        # Falsy non-mappings used to be coerced to {} by `or {}`, and a non-string
+        # key from PyYAML used to raise AttributeError instead of ProfileError.
+        cases = {
+            "policies as a list": {"policies": []},
+            "policies as a string": {"policies": "network"},
+            "network as a list": {"policies": {"network": []}},
+            "network as a string": {"policies": {"network": "allow"}},
+            "non-string top-level key": {1: "x"},
+            "non-string section key": {"policies": {1: {}}},
+            "non-string network key": {"policies": {"network": {1: []}}},
+            "name is a mapping": {"name": {"x": "y"}},
+            "description is a list": {"description": []},
+        }
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(cs.ProfileError):
+                    cs.validate_profile(data, "t")
+
+    def test_valid_domains_include_wildcards(self):
+        text = (
+            "policies:\n"
+            "  network:\n"
+            "    allow:\n"
+            "      - example.com\n"
+            "      - '*.example.com'\n"
+            "      - sub.example.co.uk\n"
+            "      - 192.0.2.10\n"
+        )
+        allowed, denied = cs.validate_profile(cs.parse_profile_minimal(text, "t"), "t")
+        self.assertEqual(
+            allowed,
+            ["example.com", "*.example.com", "sub.example.co.uk", "192.0.2.10"],
+        )
+        self.assertEqual(denied, [])
 
     def test_parser_errors_are_prefixed_with_the_profile(self):
         # load_profile is what the CLI calls; it must name the offending file.
@@ -1233,6 +1280,16 @@ class ProfileAssetPlanTests(unittest.TestCase):
                 message = str(caught.exception)
                 self.assertIn(name, message)
                 self.assertIn("agent level", message)
+
+    def test_git_is_refused_at_agent_level(self):
+        # A bundle pointed at a checkout must not ship its history into ~/.claude.
+        root = self._root()
+        self._touch(root, ".git/config", b"x")
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.profile_asset_plan(root)
+        message = str(caught.exception)
+        self.assertIn(".git", message)
+        self.assertIn("agent level", message)
 
     def test_managed_project_paths_are_refused(self):
         for relative in (".git/config", ".credentials.json"):

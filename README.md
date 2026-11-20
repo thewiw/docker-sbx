@@ -335,8 +335,11 @@ policies:
 
 Rules:
 
-- Top-level keys allowed: `name`, `description`, `policies`.
-- `policies.network` may contain `allow` and `deny`, each a list of non-empty domain strings.
+- Top-level keys allowed: `name`, `description`, `policies`; any other key is rejected
+  rather than ignored, so a typo cannot silently produce a profile with no rules.
+- `policies.network` may contain only `allow` and `deny`, each a list of non-empty domain
+  strings. An entry must look like a host (`example.com`, `*.example.com`): a URL, a path
+  or an entry containing whitespace is refused.
 - Any key that would imply a global policy is rejected; profiles are always per-sandbox.
 - Malformed or unknown profiles abort sandbox creation.
 
@@ -361,9 +364,10 @@ Rules:
 - Profiles are applied in the order given; a later profile overwrites files with the same
   name.
 - Symbolic links and special files are refused.
-- At agent level, `settings.json`, `settings.local.json` and `.credentials.json` may not be
-  installed; at project level, `settings.json` is allowed but `.git` and `.credentials.json`
-  are not.
+- At agent level, `settings.json`, `settings.local.json`, `.credentials.json` and `.git` may
+  not be installed; at project level, `settings.json` is allowed but `.git` and
+  `.credentials.json` are not. Refusing `.git` at both levels stops a bundle pointed at a
+  checkout from shipping its history into the agent's home or the shared volume.
 - An asset bundle is capped at 2000 files and 32 MiB.
 - If assets cannot be installed, creation (or `docker-sbx-apply-profile.py`) aborts rather
   than leaving a half-installed profile.
