@@ -1075,6 +1075,404 @@ else
 fi
 
 # ----------------------------------------------------------------------
+# Recorded-stub tests (27-33): exercise the create/update/recreate/from-config
+# CLI without ever touching a real sandbox. `sbx` is replaced by a recorded
+# stub that logs every invocation, answers `ls -q` with the names a test wants
+# it to "see", and captures `cp` sources so the tarballs it stages can be
+# inspected on the host. The stub directory is put on PATH only for the calls
+# that need it; the dry-run case proves that path is unnecessary.
+#
+# These drive the Python implementation directly: the modes and the config
+# file do not exist in the retired bash script, and this section must run with
+# SBX_IMPLS unset (the default).
+# ----------------------------------------------------------------------
+CREATE_SCRIPT="$REPO_DIR/docker-sbx-create-sandbox.py"
+APPLY_SCRIPT="$REPO_DIR/docker-sbx-apply-profile.py"
+RECORD_BIN="$TMPDIR/recordbin"
+STUB_LOG="$TMPDIR/sbx-stub.log"
+STUB_COPY="$TMPDIR/sbx-stub-copies"
+mkdir -p "$RECORD_BIN" "$STUB_COPY"
+cat > "$RECORD_BIN/sbx" << 'SCRIPT'
+#!/bin/bash
+if [[ -n "${SBX_STUB_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "$SBX_STUB_LOG"
+fi
+# ls -q: report the sandbox names this test wants the implementation to see.
+if [[ "${1:-}" == "ls" && "${2:-}" == "-q" ]]; then
+  if [[ -n "${SBX_STUB_NAMES:-}" ]]; then
+    printf '%s\n' "$SBX_STUB_NAMES"
+  fi
+  exit 0
+fi
+# cp <src> <name>:<dest>: keep the source so the suite can look inside it.
+if [[ "${1:-}" == "cp" && $# -ge 3 && -n "${SBX_STUB_DIR:-}" ]]; then
+  cp "$2" "$SBX_STUB_DIR/"
+  exit 0
+fi
+# Everything else (create, exec, policy, rm, ...) is recorded and succeeds.
+exit 0
+SCRIPT
+chmod +x "$RECORD_BIN/sbx"
+
+reset_stub() {
+  : > "$STUB_LOG"
+  rm -rf "$STUB_COPY"
+  mkdir -p "$STUB_COPY"
+}
+# Run the create script with the stub first on PATH. STUB_NAMES is what the
+# stub reports for `sbx ls -q`; empty means "no sandbox of that name exists".
+STUB_NAMES=""
+run_stub_create() {
+  env PATH="$RECORD_BIN:$PATH" \
+    SBX_STUB_LOG="$STUB_LOG" SBX_STUB_DIR="$STUB_COPY" \
+    SBX_STUB_NAMES="${STUB_NAMES:-}" \
+    python3 "$CREATE_SCRIPT" "$@"
+}
+# Applying profiles is its own command now, not a flag on the create script.
+run_stub_apply() {
+  env PATH="$RECORD_BIN:$PATH" \
+    SBX_STUB_LOG="$STUB_LOG" SBX_STUB_DIR="$STUB_COPY" \
+    SBX_STUB_NAMES="${STUB_NAMES:-}" \
+    python3 "$APPLY_SCRIPT" "$@"
+}
+
+# Fixtures shared by the new tests: a project directory and a profile
+# directory outside the repository, so profiles/ is never modified.
+NEW_PROJECT="$TMPDIR/new-project"
+PROFILES="$TMPDIR/new-profiles"
+mkdir -p "$NEW_PROJECT" \
+  "$PROFILES/bundled/skills/demo" \
+  "$PROFILES/bundled/project/commands" \
+  "$PROFILES/node/skills/node"
+printf 'name: bundled\ndescription: test bundle\npolicies:\n  network:\n    allow:\n      - pypi.org\n' \
+  > "$PROFILES/bundled/profile.yaml"
+printf 'demo skill\n' > "$PROFILES/bundled/skills/demo/SKILL.md"
+printf '# demo command\n' > "$PROFILES/bundled/project/commands/demo.md"
+printf 'name: node\npolicies:\n  network:\n    allow:\n      - registry.npmjs.org\n' \
+  > "$PROFILES/node/profile.yaml"
+printf 'node skill\n' > "$PROFILES/node/skills/node/SKILL.md"
+
+# ----------------------------------------------------------------------
+# TEST 27: create with a bundled profile installs its assets and records it
+# ----------------------------------------------------------------------
+echo "TEST 27: create with a bundled profile installs its assets and records it"
+BUNDLE_NAME="new-bundled"
+CFG_DIR="$TMPDIR/cfg"
+CFG_PATH="$CFG_DIR/$BUNDLE_NAME.yaml"
+reset_stub
+STUB_NAMES=""
+CREATE_RC=0
+CREATE_OUT="$(run_stub_create -n "$BUNDLE_NAME" -p "$NEW_PROJECT" -s false \
+  -profile bundled -profile-directory "$PROFILES" --config-dir "$CFG_DIR" 2>&1)" || CREATE_RC=$?
+if [[ "$CREATE_RC" == "0" ]]; then
+  pass "Create returned success"
+else
+  fail "Create returned $CREATE_RC: $CREATE_OUT"
+fi
+if [[ -f "$CFG_PATH" ]] \
+   && grep -q '^version: 1$' "$CFG_PATH" \
+   && grep -qF "$BUNDLE_NAME" "$CFG_PATH" \
+   && grep -q '^project:' "$CFG_PATH" \
+   && grep -qF "'bundled'" "$CFG_PATH" \
+   && grep -q '^profile_directory:' "$CFG_PATH"; then
+  pass "The saved config records version, name, project, profile and profile directory"
+else
+  fail "Saved config is missing fields: $(cat "$CFG_PATH" 2>/dev/null || echo missing)"
+fi
+if printf '%s\n' "$CREATE_OUT" | grep -qF "Config saved: $CFG_PATH"; then
+  pass "The config path is reported on stdout"
+else
+  fail "Config saved line missing: $CFG_PATH"
+fi
+if grep -qF "policy allow network --sandbox $BUNDLE_NAME" "$STUB_LOG"; then
+  pass "The profile's network rule is applied to the sandbox"
+else
+  fail "No policy allow network call for $BUNDLE_NAME"
+fi
+if grep -qE "^cp .*/agent\.tgz $BUNDLE_NAME:" "$STUB_LOG" \
+   && grep -qE "^cp .*/project\.tgz $BUNDLE_NAME:" "$STUB_LOG"; then
+  pass "Both agent- and project-level asset tarballs are copied in"
+else
+  fail "A profile asset tarball was not copied: $(grep -E '^cp ' "$STUB_LOG" || echo none)"
+fi
+if grep -qE "^exec -i $BUNDLE_NAME sh -c .*tar -xzf " "$STUB_LOG"; then
+  pass "Each tarball is extracted inside the sandbox with tar -xzf"
+else
+  fail "No tar -xzf exec for $BUNDLE_NAME"
+fi
+if tar -tzf "$STUB_COPY/agent.tgz" 2>/dev/null | grep -qx 'skills/demo/SKILL.md'; then
+  pass "The agent tarball carries skills/demo/SKILL.md"
+else
+  fail "The agent tarball does not contain the bundled skill"
+fi
+if tar -tzf "$STUB_COPY/project.tgz" 2>/dev/null | grep -qx 'commands/demo.md'; then
+  pass "The project tarball carries commands/demo.md"
+else
+  fail "The project tarball does not contain the bundled command"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 28: the config path is displayed at the very end of the run
+# ----------------------------------------------------------------------
+echo "TEST 28: the config path is displayed at the very end of the run"
+# The summary ends with "Config saved: <path>" followed by the "Recreate
+# later with:" hint (when a config was written), so the path must appear in
+# that final block rather than scrolling past earlier in the output.
+FINAL_BANNER_LINE="$(printf '%s\n' "$CREATE_OUT" | grep -n '^═' | tail -n 1 | cut -d: -f1 || true)"
+CONFIG_SAVED_LINE="$(printf '%s\n' "$CREATE_OUT" | grep -nF "Config saved: $CFG_PATH" | tail -n 1 | cut -d: -f1 || true)"
+if [[ -n "$FINAL_BANNER_LINE" && -n "$CONFIG_SAVED_LINE" && "$CONFIG_SAVED_LINE" -gt "$FINAL_BANNER_LINE" ]]; then
+  pass "The config path is printed after the final sandbox banner"
+else
+  fail "Config saved line is not in the closing block (banner=$FINAL_BANNER_LINE, config=$CONFIG_SAVED_LINE)"
+fi
+LAST_TWO="$(printf '%s\n' "$CREATE_OUT" | grep -v '^[[:space:]]*$' | tail -n 2)"
+if printf '%s\n' "$LAST_TWO" | grep -qF "Config saved: $CFG_PATH"; then
+  pass "The config path is one of the last two non-empty lines"
+else
+  fail "The run did not end with the config path: $LAST_TWO"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 29: --dry-run writes no config and never invokes sbx
+# ----------------------------------------------------------------------
+echo "TEST 29: --dry-run writes no config and never invokes sbx"
+DRY_CFG="$TMPDIR/cfg-dry"
+EMPTY_BIN="$TMPDIR/emptybin"
+mkdir -p "$EMPTY_BIN"
+: > "$STUB_LOG"
+PYTHON_BIN="$(command -v python3)"
+# The stub is deliberately absent from PATH: a dry run needs no sbx at all.
+DRY_RC=0
+DRY_OUT="$(env PATH="$EMPTY_BIN" SBX_STUB_LOG="$STUB_LOG" "$PYTHON_BIN" "$CREATE_SCRIPT" \
+  --dry-run -n new-dry -p "$NEW_PROJECT" -s false \
+  -profile bundled -profile-directory "$PROFILES" --config-dir "$DRY_CFG" 2>&1)" || DRY_RC=$?
+if [[ "$DRY_RC" == "0" ]]; then
+  pass "Dry run returned success without sbx on PATH"
+else
+  fail "Dry run returned $DRY_RC: $DRY_OUT"
+fi
+if [[ ! -s "$STUB_LOG" ]]; then
+  pass "No sbx command was actually executed"
+else
+  fail "Dry run invoked sbx: $(cat "$STUB_LOG")"
+fi
+if printf '%s\n' "$DRY_OUT" | grep -qF "Config would be saved: $DRY_CFG/new-dry.yaml"; then
+  pass "Dry run reports the config it would write"
+else
+  fail "Config would be saved line missing"
+fi
+if printf '%s\n' "$DRY_OUT" | grep -qF '$ sbx create'; then
+  pass "Dry run echoes the create command it would run"
+else
+  fail "Dry run did not echo the create command"
+fi
+DRY_FILES="$(find "$DRY_CFG" -type f 2>/dev/null || true)"
+if [[ -z "$DRY_FILES" ]]; then
+  pass "Dry run wrote no config file"
+else
+  fail "Dry run wrote: $DRY_FILES"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 30: docker-sbx-apply-profile.py applies and records a profile
+# ----------------------------------------------------------------------
+echo "TEST 30: docker-sbx-apply-profile.py applies and records a profile"
+UPDATE_NAME="new-update"
+UPDATE_CFG="$TMPDIR/cfg-update"
+mkdir -p "$UPDATE_CFG"
+cat > "$UPDATE_CFG/$UPDATE_NAME.yaml" << EOF
+version: 1
+name: '$UPDATE_NAME'
+project: '$NEW_PROJECT'
+scan_secrets: false
+profiles:
+  - 'python'
+EOF
+reset_stub
+STUB_NAMES="$UPDATE_NAME"
+UPDATE_RC=0
+UPDATE_OUT="$(run_stub_apply -n "$UPDATE_NAME" -profile node \
+  -profile-directory "$PROFILES" --config-dir "$UPDATE_CFG" 2>&1)" || UPDATE_RC=$?
+if [[ "$UPDATE_RC" == "0" ]]; then
+  pass "Profile update returned success for an existing sandbox"
+else
+  fail "Profile update returned $UPDATE_RC: $UPDATE_OUT"
+fi
+if ! grep -qE '^create( |$)' "$STUB_LOG"; then
+  pass "Update mode never creates the sandbox again"
+else
+  fail "Update mode ran sbx create: $(cat "$STUB_LOG")"
+fi
+if grep -qF "policy allow network --sandbox $UPDATE_NAME" "$STUB_LOG" \
+   && grep -qF 'tar -xzf' "$STUB_LOG"; then
+  pass "The new profile's network rule and assets are applied"
+else
+  fail "The new profile was not fully applied: $(cat "$STUB_LOG")"
+fi
+if grep -qF "'python'" "$UPDATE_CFG/$UPDATE_NAME.yaml" \
+   && grep -qF "'node'" "$UPDATE_CFG/$UPDATE_NAME.yaml"; then
+  pass "The config now lists both the old and the new profile"
+else
+  fail "The config was not updated: $(cat "$UPDATE_CFG/$UPDATE_NAME.yaml" 2>/dev/null || echo missing)"
+fi
+if printf '%s\n' "$UPDATE_OUT" | grep -qF "Config updated: $UPDATE_CFG/$UPDATE_NAME.yaml"; then
+  pass "The update is reported on stdout"
+else
+  fail "Config updated line missing"
+fi
+# The update flow is no longer reachable from the create script.
+REJECT_RC=0
+REJECT_OUT="$(run_stub_create -n "$UPDATE_NAME" -profile node --apply-profile 2>&1)" || REJECT_RC=$?
+if [[ "$REJECT_RC" != "0" ]] \
+   && printf '%s\n' "$REJECT_OUT" | grep -qF "Unknown option: --apply-profile"; then
+  pass "The create script rejects the retired --apply-profile flag"
+else
+  fail "The retired --apply-profile flag was not rejected: $REJECT_OUT"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 31: --recreate refuses without --force, and removes before creating
+# ----------------------------------------------------------------------
+echo "TEST 31: --recreate refuses without --force, and removes before creating"
+RECREATE_NAME="new-recreate"
+RECREATE_CFG="$TMPDIR/cfg-recreate"
+mkdir -p "$RECREATE_CFG"
+cat > "$RECREATE_CFG/$RECREATE_NAME.yaml" << EOF
+version: 1
+name: '$RECREATE_NAME'
+project: '$NEW_PROJECT'
+scan_secrets: false
+EOF
+reset_stub
+STUB_NAMES="$RECREATE_NAME"
+REFUSE_RC=0
+REFUSE_OUT="$(run_stub_create -n "$RECREATE_NAME" --recreate \
+  --config-dir "$RECREATE_CFG" 2>&1)" || REFUSE_RC=$?
+if [[ "$REFUSE_RC" != "0" ]]; then
+  pass "Recreate refuses when the sandbox already exists and --force is absent"
+else
+  fail "Recreate removed an existing sandbox without --force: $REFUSE_OUT"
+fi
+if ! grep -qE '^(create|rm)( |$)' "$STUB_LOG"; then
+  pass "The refused run neither removed nor created anything"
+else
+  fail "The refused run touched the sandbox: $(cat "$STUB_LOG")"
+fi
+reset_stub
+STUB_NAMES="$RECREATE_NAME"
+FORCE_RC=0
+FORCE_OUT="$(run_stub_create -n "$RECREATE_NAME" --recreate --force \
+  --config-dir "$RECREATE_CFG" 2>&1)" || FORCE_RC=$?
+if [[ "$FORCE_RC" == "0" ]]; then
+  pass "Recreate with --force returned success"
+else
+  fail "Recreate with --force returned $FORCE_RC: $FORCE_OUT"
+fi
+RM_LINE="$(grep -m1 -nE "^rm $RECREATE_NAME$" "$STUB_LOG" | cut -d: -f1 || true)"
+CREATE_LINE="$(grep -m1 -nE "^create --name $RECREATE_NAME( |$)" "$STUB_LOG" | cut -d: -f1 || true)"
+if [[ -n "$RM_LINE" && -n "$CREATE_LINE" && "$RM_LINE" -lt "$CREATE_LINE" ]]; then
+  pass "The existing sandbox is removed before the new one is created"
+else
+  fail "Expected rm before create (rm=$RM_LINE, create=$CREATE_LINE): $(cat "$STUB_LOG")"
+fi
+if [[ -f "$RECREATE_CFG/$RECREATE_NAME.yaml" ]]; then
+  pass "A config still exists after the recreate"
+else
+  fail "The recreate lost the sandbox config"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 32: --from-config honours the saved volumes and records the import
+# ----------------------------------------------------------------------
+echo "TEST 32: --from-config honours the saved volumes and records the import"
+IMPORT_NAME="new-imported"
+IMPORT_CFG="$TMPDIR/cfg-import"
+IMPORT_RO="$TMPDIR/import-ro"
+IMPORT_RW="$TMPDIR/import-rw"
+mkdir -p "$IMPORT_RO" "$IMPORT_RW"
+IMPORT_FILE="$TMPDIR/imported.yaml"
+cat > "$IMPORT_FILE" << EOF
+version: 1
+name: '$IMPORT_NAME'
+project: '$NEW_PROJECT'
+scan_secrets: false
+profiles:
+  - 'node'
+profile_directory: '$PROFILES'
+volumes:
+  - '$IMPORT_RO:ro'
+  - '$IMPORT_RW:rw'
+EOF
+reset_stub
+STUB_NAMES=""
+IMPORT_RC=0
+IMPORT_OUT="$(run_stub_create --from-config "$IMPORT_FILE" \
+  --config-dir "$IMPORT_CFG" 2>&1)" || IMPORT_RC=$?
+if [[ "$IMPORT_RC" == "0" ]]; then
+  pass "Create-from-config returned success"
+else
+  fail "Create-from-config returned $IMPORT_RC: $IMPORT_OUT"
+fi
+IMPORT_CREATE_LINE="$(grep -m1 '^create ' "$STUB_LOG" || true)"
+if printf '%s\n' "$IMPORT_CREATE_LINE" | grep -qF "create --name $IMPORT_NAME " \
+   && printf '%s\n' "$IMPORT_CREATE_LINE" | grep -qF "$NEW_PROJECT"; then
+  pass "The create command names the saved sandbox and project"
+else
+  fail "Unexpected create line: $IMPORT_CREATE_LINE"
+fi
+if printf '%s\n' "$IMPORT_CREATE_LINE" | grep -qF "$IMPORT_RO:ro" \
+   && printf '%s\n' "$IMPORT_CREATE_LINE" | grep -qF " $IMPORT_RW" \
+   && ! printf '%s\n' "$IMPORT_CREATE_LINE" | grep -qF "$IMPORT_RW:ro" \
+   && ! printf '%s\n' "$IMPORT_CREATE_LINE" | grep -qF "$IMPORT_RW:rw"; then
+  pass "The read-only volume is passed explicit and the read-write one bare"
+else
+  fail "Volume arguments are wrong: $IMPORT_CREATE_LINE"
+fi
+if [[ -f "$IMPORT_CFG/$IMPORT_NAME.yaml" ]] \
+   && grep -qF "'node'" "$IMPORT_CFG/$IMPORT_NAME.yaml"; then
+  pass "The imported sandbox gets its own config under --config-dir"
+else
+  fail "The imported config was not written: $(cat "$IMPORT_CFG/$IMPORT_NAME.yaml" 2>/dev/null || echo missing)"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 33: an invalid profile bundle aborts before any config is written
+# ----------------------------------------------------------------------
+echo "TEST 33: an invalid profile bundle aborts before any config is written"
+BAD_PROFILES="$TMPDIR/profiles-bad"
+BAD_NAME="new-invalid"
+BAD_CFG="$TMPDIR/cfg-bad"
+mkdir -p "$BAD_PROFILES/invalid"
+printf 'name: invalid\ndescription: bad bundle\n' > "$BAD_PROFILES/invalid/profile.yaml"
+# settings.json at the bundle root would overwrite a file docker-sbx owns.
+printf '{}\n' > "$BAD_PROFILES/invalid/settings.json"
+reset_stub
+STUB_NAMES=""
+BAD_RC=0
+BAD_OUT="$(run_stub_create -n "$BAD_NAME" -p "$NEW_PROJECT" -s false \
+  -profile invalid -profile-directory "$BAD_PROFILES" --config-dir "$BAD_CFG" 2>&1)" || BAD_RC=$?
+if [[ "$BAD_RC" != "0" ]]; then
+  pass "Creation aborts on an invalid profile bundle"
+else
+  fail "Creation succeeded despite the invalid bundle: $BAD_OUT"
+fi
+if printf '%s\n' "$BAD_OUT" | grep -qF 'settings.json'; then
+  pass "The error names the offending asset"
+else
+  fail "The error does not name settings.json: $BAD_OUT"
+fi
+if ! grep -qE '^create( |$)' "$STUB_LOG"; then
+  pass "Nothing is created when the bundle is invalid"
+else
+  fail "The invalid bundle was detected only after sbx create: $(cat "$STUB_LOG")"
+fi
+if [[ ! -f "$BAD_CFG/$BAD_NAME.yaml" ]]; then
+  pass "No config is written for a failed bundle"
+else
+  fail "A config was written despite the failure"
+fi
+
+# ----------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------
 echo ""

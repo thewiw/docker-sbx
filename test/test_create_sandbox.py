@@ -4,9 +4,11 @@
 Covers the pure helpers the CLI relies on: argument parsing, the env-file reader,
 volume specs, Slack and Nextcloud Talk validation, provider-script staging, host
 extraction, the secrets-file scanner, the minimal YAML profile parser, the
-sandbox-name pre-check and the wait for a new sandbox's first start. The
-end-to-end behaviour is covered separately by
-test/run-tests.sh, which drives this implementation's CLI.
+sandbox-name pre-check and the wait for a new sandbox's first start. It also
+covers the newer per-sandbox workflow: mode selection (create/update/recreate/
+from-config), profile bundles and their asset plans, the config file renderer and
+reader, and the main() branches that drive them. The end-to-end behaviour is
+covered separately by test/run-tests.sh, which drives this implementation's CLI.
 
     python3 -m unittest discover -s test -p 'test_*.py'
     (or, from inside test/:  python3 -m unittest test_create_sandbox)
@@ -16,9 +18,11 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import tarfile
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 # The module name has hyphens, so it cannot be imported by name. The script sits
@@ -918,6 +922,1059 @@ class ProfileParserTests(unittest.TestCase):
         with self.assertRaises(cs.ProfileError) as caught:
             cs.load_profile(str(path))
         self.assertIn(str(path), str(caught.exception))
+
+
+class ModeSelectionTests(unittest.TestCase):
+    """The create CLI has three modes: create (default), recreate, from-config.
+
+    Applying profiles to a live sandbox is its own command
+    (docker-sbx-apply-profile.py); it reuses the same flag validator under the
+    "update" mode, which is covered here and in test_apply_profile.py.
+    """
+
+    def test_new_boolean_flags_parse(self):
+        for flag, attribute in (
+            ("--recreate", "recreate"),
+            ("--force", "force"),
+            ("--no-config", "no_config"),
+        ):
+            with self.subTest(flag=flag):
+                cfg = cs.parse_args([flag])
+                self.assertTrue(getattr(cfg, attribute))
+                self.assertEqual(cfg.seen, {attribute})
+
+    def test_new_value_flags_parse(self):
+        cfg = cs.parse_args(["--from-config", "s.yaml", "--config-dir", "/cfg"])
+        self.assertEqual(cfg.from_config, "s.yaml")
+        self.assertEqual(cfg.config_dir, "/cfg")
+        self.assertEqual(cfg.seen, {"from_config", "config_dir"})
+
+    def test_seen_records_every_named_option(self):
+        cfg = cs.parse_args(["-n", "d", "-p", "/x", "-v", "/a", "-v", "/b"])
+        self.assertEqual(cfg.seen, {"name", "path", "volumes"})
+
+    def test_select_mode(self):
+        cases = {
+            ("-n", "d", "-p", "/x"): "create",
+            ("-n", "d", "--recreate"): "recreate",
+            ("--from-config", "s.yaml"): "from-config",
+        }
+        for argv, expected in cases.items():
+            with self.subTest(argv=argv):
+                self.assertEqual(cs.select_mode(cs.parse_args(list(argv))), expected)
+
+    def test_two_modes_name_both_flags(self):
+        for argv in (
+            ("--recreate", "--from-config", "s.yaml"),
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(cs.CliError) as caught:
+                    cs.select_mode(cs.parse_args(list(argv)))
+                message = str(caught.exception)
+                self.assertIn("Only one of", message)
+                for flag in (item for item in argv if item.startswith("-")):
+                    self.assertIn(flag, message)
+
+    def test_force_requires_recreate(self):
+        for argv in (("--force",), ("--force", "--from-config", "s.yaml")):
+            with self.subTest(argv=argv):
+                cfg = cs.parse_args(list(argv))
+                with self.assertRaises(cs.CliError) as caught:
+                    cs.validate_mode_flags(cfg, cs.select_mode(cfg))
+                self.assertIn("--force is only valid with --recreate", str(caught.exception))
+
+    def test_create_accepts_the_historical_flag_set(self):
+        cfg = cs.parse_args(
+            ["-n", "d", "-p", "/x", "-e", "f.env", "-s", "false", "-sf", "s.json",
+             "-gsf", "g.json", "-v", "/a", "-profile", "python",
+             "-profile-directory", "/p", "--no-config", "--dry-run"]
+        )
+        self.assertEqual(cs.select_mode(cfg), "create")
+        cs.validate_mode_flags(cfg, "create")  # must not raise
+
+    def test_update_rejects_create_only_flags(self):
+        cases = {
+            "path": ("-p", "/x", "-p"),
+            "envfile": ("-e", "f.env", "-e"),
+            "secrets": ("-s", "false", "-s"),
+            "secretsfile": ("-sf", "s.json", "-sf"),
+            "volumes": ("-v", "/a", "-v"),
+        }
+        for label, (option, value, shown) in cases.items():
+            with self.subTest(option=option):
+                cfg = cs.parse_args(["-n", "d", "-profile", "python", option, value])
+                with self.assertRaises(cs.CliError) as caught:
+                    cs.validate_mode_flags(cfg, "update")
+                self.assertIn(
+                    f"Option {shown} cannot be used with the apply-profile command",
+                    str(caught.exception),
+                )
+
+    def test_recreate_rejects_create_only_flags(self):
+        cases = {
+            "path": ("-p", "/x", "-p"),
+            "volumes": ("-v", "/a", "-v"),
+            "profiles": ("-profile", "python", "-profile"),
+        }
+        for label, (option, value, shown) in cases.items():
+            with self.subTest(option=option):
+                cfg = cs.parse_args(["-n", "d", "--recreate", option, value])
+                self.assertEqual(cs.select_mode(cfg), "recreate")
+                with self.assertRaises(cs.CliError) as caught:
+                    cs.validate_mode_flags(cfg, "recreate")
+                self.assertIn(
+                    f"Option {shown} cannot be used with --recreate",
+                    str(caught.exception),
+                )
+
+    def test_from_config_rejects_create_only_flags(self):
+        cases = {
+            "name": ("-n", "d", "-n"),
+            "path": ("-p", "/x", "-p"),
+            "profiles": ("-profile", "python", "-profile"),
+        }
+        for label, (option, value, shown) in cases.items():
+            with self.subTest(option=option):
+                cfg = cs.parse_args(["--from-config", "s.yaml", option, value])
+                self.assertEqual(cs.select_mode(cfg), "from-config")
+                with self.assertRaises(cs.CliError) as caught:
+                    cs.validate_mode_flags(cfg, "from-config")
+                self.assertIn(
+                    f"Option {shown} cannot be used with --from-config",
+                    str(caught.exception),
+                )
+
+    def test_help_returns_immediately_and_documents_the_new_modes(self):
+        # -h is handled before the rest of the argv, so a bad trailing option is
+        # not even looked at.
+        self.assertTrue(cs.parse_args(["-h", "--bogus"]).show_help)
+        self.assertTrue(cs.parse_args(["--help", "--bogus"]).show_help)
+        text = cs.usage_text()
+        for needle in ("--recreate", "--from-config", "--config-dir",
+                       "--no-config", "--force"):
+            self.assertIn(needle, text)
+        self.assertNotIn("--apply-profile", text)
+        self.assertIn("docker-sbx-apply-profile.py", text)
+
+    def test_update_help_documents_only_the_update_flags(self):
+        text = cs.usage_text("update")
+        for needle in ("-profile", "-profile-directory", "--config-dir",
+                       "--no-config", "--dry-run"):
+            self.assertIn(needle, text)
+        for absent in ("-p [project path]", "--recreate", "--from-config", "--force"):
+            self.assertNotIn(absent, text)
+
+
+class ResolveProfileTests(unittest.TestCase):
+    """A profile is either <dir>/<name>/profile.yaml or <dir>/<name>.yaml.
+
+    Defining the same name twice is ambiguous, so it is refused instead of
+    resolved by precedence.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _write(self, relative, text=""):
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        return target
+
+    def test_directory_form(self):
+        definition = self._write("demo/profile.yaml")
+        source = cs.resolve_profile(self.root, "demo")
+        self.assertEqual(source.name, "demo")
+        self.assertEqual(source.definition, definition)
+        self.assertEqual(source.assets_root, self.root / "demo")
+
+    def test_directory_form_accepts_profile_yml(self):
+        definition = self._write("demo/profile.yml")
+        source = cs.resolve_profile(self.root, "demo")
+        self.assertEqual(source.definition, definition)
+        self.assertEqual(source.assets_root, self.root / "demo")
+
+    def test_flat_forms(self):
+        for extension in ("yaml", "yml"):
+            with self.subTest(extension=extension):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                root = Path(tmp.name)
+                definition = root / f"demo.{extension}"
+                definition.write_text("")
+                source = cs.resolve_profile(root, "demo")
+                self.assertEqual(source.definition, definition)
+                self.assertIsNone(source.assets_root)
+
+    def test_directory_and_flat_together_is_an_error(self):
+        self._write("demo/profile.yaml")
+        self._write("demo.yaml")
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.resolve_profile(self.root, "demo")
+        self.assertIn("defined both as a directory", str(caught.exception))
+
+    def test_profile_yaml_and_profile_yml_together_is_an_error(self):
+        self._write("demo/profile.yaml")
+        self._write("demo/profile.yml")
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.resolve_profile(self.root, "demo")
+        self.assertIn("both profile.yaml and profile.yml", str(caught.exception))
+
+    def test_flat_yaml_and_yml_together_is_an_error(self):
+        self._write("demo.yaml")
+        self._write("demo.yml")
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.resolve_profile(self.root, "demo")
+        self.assertIn("exists as both demo.yaml and demo.yml", str(caught.exception))
+
+    def test_missing_profile_names_the_directory(self):
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.resolve_profile(self.root, "nope")
+        self.assertEqual(
+            str(caught.exception),
+            f"profile 'nope' not found in '{self.root}'",
+        )
+
+
+class ProfileAssetPlanTests(unittest.TestCase):
+    """A profile directory may carry files that mirror the sandbox's ~/.claude.
+
+    The plan decides what is installed at agent level and what is installed at
+    project level, and refuses anything that could escape either tree.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _root(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        return Path(tmp.name)
+
+    def _touch(self, root, relative, data=b"x", mode=None):
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        if mode is not None:
+            os.chmod(target, mode)
+        return target
+
+    def test_plan_splits_agent_and_project_levels(self):
+        tree = [
+            ("profile.yaml", b"name: demo\n"),
+            ("CLAUDE.md", b"root file"),
+            ("skills/x/SKILL.md", b"skill"),
+            ("agent/agents/h.md", b"helper"),
+            ("project/commands/c.md", b"command"),
+        ]
+        for relative, data in tree:
+            self._touch(self.root, relative, data)
+
+        agent, project = cs.profile_asset_plan(self.root)
+
+        self.assertEqual([entry[0] for entry in agent],
+                         ["CLAUDE.md", "agents/h.md", "skills/x/SKILL.md"])
+        self.assertEqual([entry[0] for entry in project], ["commands/c.md"])
+        for arcname, source, mode, size in agent + project:
+            self.assertIsInstance(source, Path)
+            self.assertTrue(source.is_file())
+            self.assertEqual(size, source.stat().st_size)
+            self.assertIsInstance(mode, int)
+
+    def test_profile_definition_is_never_installed(self):
+        self._touch(self.root, "profile.yaml", b"name: demo\n")
+        self._touch(self.root, "profile.yml", b"name: demo\n")
+        self._touch(self.root, "CLAUDE.md", b"hi")
+        agent, project = cs.profile_asset_plan(self.root)
+        self.assertEqual([entry[0] for entry in agent + project], ["CLAUDE.md"])
+
+    def test_plan_is_deterministic(self):
+        for relative in ("skills/x/SKILL.md", "skills/a.md", "agent/agents/h.md",
+                         "CLAUDE.md", "README.md", "project/c.md"):
+            self._touch(self.root, relative)
+        first = cs.profile_asset_plan(self.root)
+        second = cs.profile_asset_plan(self.root)
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [entry[0] for entry in first[0]],
+            ["CLAUDE.md", "README.md", "agents/h.md", "skills/a.md",
+             "skills/x/SKILL.md"],
+        )
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_symlinks_are_refused(self):
+        self._touch(self.root, "CLAUDE.md", b"hi")
+        os.symlink(self.root / "CLAUDE.md", self.root / "link")
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.profile_asset_plan(self.root)
+        self.assertIn("symlink", str(caught.exception))
+        self.assertIn("link", str(caught.exception))
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_symlinks_inside_a_subdirectory_are_refused(self):
+        self._touch(self.root, "skills/x", b"x")
+        self._touch(self.root, "other/y", b"y")
+        os.symlink(self.root / "other", self.root / "skills" / "linked")
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.profile_asset_plan(self.root)
+        self.assertIn("symlink", str(caught.exception))
+
+    def test_managed_agent_files_are_refused(self):
+        for name in ("settings.json", "settings.local.json", ".credentials.json"):
+            with self.subTest(name=name):
+                root = self._root()
+                self._touch(root, name, b"{}")
+                with self.assertRaises(cs.ProfileError) as caught:
+                    cs.profile_asset_plan(root)
+                message = str(caught.exception)
+                self.assertIn(name, message)
+                self.assertIn("agent level", message)
+
+    def test_managed_project_paths_are_refused(self):
+        for relative in (".git/config", ".credentials.json"):
+            with self.subTest(relative=relative):
+                root = self._root()
+                self._touch(root, f"project/{relative}", b"x")
+                with self.assertRaises(cs.ProfileError) as caught:
+                    cs.profile_asset_plan(root)
+                message = str(caught.exception)
+                self.assertIn(relative.split("/")[0], message)
+                self.assertIn("project level", message)
+
+    def test_agent_and_project_must_be_directories(self):
+        for name in ("agent", "project"):
+            with self.subTest(name=name):
+                root = self._root()
+                self._touch(root, name, b"not a directory")
+                with self.assertRaises(cs.ProfileError) as caught:
+                    cs.profile_asset_plan(root)
+                self.assertIn(f"'{name}' must be a directory", str(caught.exception))
+
+    @unittest.skipIf(os.name == "nt", "os.mkfifo is not available on Windows")
+    def test_non_regular_files_are_refused(self):
+        root = self._root()
+        (root / "skills").mkdir()
+        try:
+            os.mkfifo(root / "skills" / "pipe")
+        except (AttributeError, OSError) as exc:
+            self.skipTest(f"cannot create a FIFO here: {exc}")
+        with self.assertRaises(cs.ProfileError) as caught:
+            cs.profile_asset_plan(root)
+        self.assertIn("not a regular file", str(caught.exception))
+        self.assertIn("pipe", str(caught.exception))
+
+    def test_the_file_count_limit_is_enforced(self):
+        self._touch(self.root, "a", b"a")
+        self._touch(self.root, "b", b"b")
+        with mock.patch.object(cs, "ASSET_MAX_FILES", 1):
+            with self.assertRaises(cs.ProfileError) as caught:
+                cs.profile_asset_plan(self.root)
+        self.assertIn("too large to install", str(caught.exception))
+        self.assertIn("2 files", str(caught.exception))
+
+    def test_the_byte_limit_is_enforced(self):
+        self._touch(self.root, "a", b"ab")
+        with mock.patch.object(cs, "ASSET_MAX_BYTES", 1):
+            with self.assertRaises(cs.ProfileError) as caught:
+                cs.profile_asset_plan(self.root)
+        self.assertIn("too large to install", str(caught.exception))
+
+
+class AssetTarballTests(unittest.TestCase):
+    """The bundle is built in-process (no host tar) and reproducibly."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _write(self, relative, data, mode):
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        os.chmod(target, mode)
+        return target
+
+    def test_archive_members_are_normalised(self):
+        self._write("CLAUDE.md", b"hi\n", 0o644)
+        self._write("skills/x/SKILL.md", b"#!/bin/sh\n", 0o755)
+        agent, project = cs.profile_asset_plan(self.root)
+        files = agent + project
+
+        destination = self.root / "bundle.tgz"
+        cs.build_asset_tarball(files, destination)
+        self.assertTrue(destination.is_file())
+
+        with tarfile.open(destination) as archive:
+            members = archive.getmembers()
+            self.assertEqual([member.name for member in members],
+                             [entry[0] for entry in files])
+            for member in members:
+                self.assertEqual(member.uid, 0)
+                self.assertEqual(member.gid, 0)
+                self.assertEqual(member.uname, "")
+                self.assertEqual(member.gname, "")
+                self.assertEqual(member.mtime, 0)
+                self.assertFalse(member.name.startswith("/"))
+                self.assertNotIn("..", PurePosixPath(member.name).parts)
+            by_name = {member.name: member for member in members}
+            self.assertEqual(by_name["CLAUDE.md"].mode, 0o644)
+            self.assertEqual(by_name["skills/x/SKILL.md"].mode, 0o755)
+
+
+class SandboxProjectPathTests(unittest.TestCase):
+    def test_windows_paths_are_mapped_into_the_sandbox(self):
+        cases = {
+            r"C:\Users\me\proj": "/c/Users/me/proj",
+            "C:/x/y": "/c/x/y",
+            r"D:\a": "/d/a",
+            "/mnt/c/x": "/mnt/c/x",
+            "relative/path": "relative/path",
+        }
+        for host_path, expected in cases.items():
+            with self.subTest(host_path=host_path):
+                self.assertEqual(cs.sandbox_project_path(host_path), expected)
+
+
+class DefaultConfigDirTests(unittest.TestCase):
+    """The saved-config directory follows each platform's convention."""
+
+    def test_linux_uses_xdg_config_home_when_set(self):
+        with mock.patch.object(cs.os, "name", "posix"), mock.patch.object(
+            cs.sys, "platform", "linux"
+        ), mock.patch.dict(
+            cs.os.environ, {"XDG_CONFIG_HOME": "/tmp/xdg"}, clear=False
+        ), mock.patch.object(
+            cs, "Path", PurePosixPath
+        ):
+            self.assertEqual(
+                cs.default_config_dir(),
+                PurePosixPath("/tmp/xdg") / "docker-sbx" / "sandboxes",
+            )
+
+    @unittest.skipIf(os.name == "nt", "Path.home() would select WindowsPath")
+    def test_linux_defaults_to_dot_config_under_home(self):
+        env = {key: value for key, value in cs.os.environ.items()
+               if key != "XDG_CONFIG_HOME"}
+        with mock.patch.object(cs.os, "name", "posix"), mock.patch.object(
+            cs.sys, "platform", "linux"
+        ), mock.patch.dict(cs.os.environ, env, clear=True):
+            result = cs.default_config_dir()
+        self.assertEqual(result, Path.home() / ".config" / "docker-sbx" / "sandboxes")
+        self.assertTrue(str(result).endswith(".config/docker-sbx/sandboxes"))
+
+    @unittest.skipIf(os.name == "nt", "Path.home() would select WindowsPath")
+    def test_macos_uses_application_support(self):
+        with mock.patch.object(cs.os, "name", "posix"), mock.patch.object(
+            cs.sys, "platform", "darwin"
+        ):
+            result = cs.default_config_dir()
+        self.assertEqual(
+            result,
+            Path.home() / "Library" / "Application Support" / "docker-sbx" / "sandboxes",
+        )
+        self.assertIn("Library/Application Support/docker-sbx/sandboxes", result.as_posix())
+
+    def test_windows_uses_appdata(self):
+        appdata = "/appdata/roaming"
+        # cs.Path is pinned to a pure class so this branch can be exercised on a
+        # POSIX host too; APPDATA is set, so Path.home() is never reached.
+        with mock.patch.object(cs.os, "name", "nt"), mock.patch.dict(
+            cs.os.environ, {"APPDATA": appdata}, clear=False
+        ), mock.patch.object(cs, "Path", PurePosixPath):
+            result = cs.default_config_dir()
+        self.assertEqual(
+            result, PurePosixPath(appdata) / "docker-sbx" / "sandboxes"
+        )
+
+
+class ConfigFileTests(unittest.TestCase):
+    def setUp(self):
+        self._config = cs.CONFIG
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self._restore)
+        self.root = Path(self._tmp.name)
+        cs.CONFIG = cs.parse_args(["-n", "demo", "-p", "/x"])
+        cs.CONFIG.config_dir = str(self.root / "cfg")
+
+    def _restore(self):
+        cs.CONFIG = self._config
+
+    def test_names_that_would_escape_the_directory_are_refused(self):
+        for name in ("", ".", "..", "a/b", "a\\b"):
+            with self.subTest(name=name):
+                with self.assertRaises(cs.ConfigError) as caught:
+                    cs.config_file(name)
+                self.assertIn("cannot be used as a config file name", str(caught.exception))
+
+    def test_path_is_the_config_dir_plus_the_sandbox_name(self):
+        self.assertEqual(cs.config_file("demo"), self.root / "cfg" / "demo.yaml")
+
+
+class ConfigRoundTripTests(unittest.TestCase):
+    """render_config and load_config must agree, including awkward paths."""
+
+    PROJECT = "/home/o'brien/my proj"
+    VOLUME = "/home/o'brien/data dir:rw"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _values(self, **overrides):
+        values = {
+            "name": "demo",
+            "project": self.PROJECT,
+            "env_file": "/home/o'brien/env file.env",
+            "scan_secrets": "false",
+            "secrets_settings": "/home/o'brien/scan it.json",
+            "profiles": ["python", "node"],
+            "profile_directory": "/home/o'brien/profiles dir",
+            "volumes": [self.VOLUME],
+        }
+        values.update(overrides)
+        return values
+
+    def _base(self, **overrides):
+        data = {"version": 1, "name": "demo", "project": "/p"}
+        data.update(overrides)
+        return data
+
+    def test_all_keys_round_trip(self):
+        values = self._values()
+        target = self.root / "demo.yaml"
+        target.write_text(cs.render_config(values))
+
+        loaded = cs.load_config(str(target))
+
+        self.assertEqual(loaded["name"], "demo")
+        self.assertEqual(loaded["project"], self.PROJECT)
+        self.assertEqual(loaded["env_file"], values["env_file"])
+        self.assertEqual(loaded["scan_secrets"], "false")
+        self.assertEqual(loaded["secrets_settings"], values["secrets_settings"])
+        self.assertEqual(loaded["profiles"], ["python", "node"])
+        self.assertEqual(loaded["profile_directory"], values["profile_directory"])
+        self.assertEqual(loaded["volumes"], [self.VOLUME])
+
+    def test_minimal_parser_unescapes_single_quotes(self):
+        # The writer escapes an apostrophe as '' and _scalar must map it back.
+        text = cs.render_config(self._values())
+        parsed = cs.parse_profile_minimal(text, "config")
+        self.assertEqual(parsed["project"], self.PROJECT)
+        self.assertEqual(parsed["env_file"], "/home/o'brien/env file.env")
+        self.assertEqual(parsed["volumes"], [self.VOLUME])
+
+    def test_optional_keys_are_omitted_when_empty(self):
+        text = cs.render_config({"name": "demo", "project": "/p",
+                                 "scan_secrets": "true"})
+        for key in ("env_file:", "secrets_settings:", "profile_directory:",
+                    "profiles:", "volumes:"):
+            self.assertNotIn(key, text)
+        self.assertIn("scan_secrets: true", text)
+
+    def test_scan_secrets_accepts_bools_and_strings(self):
+        for value, expected in (
+            (True, "true"), (False, "false"),
+            ("true", "true"), ("false", "false"),
+            ("TRUE", "true"), ("False", "false"),
+        ):
+            with self.subTest(value=value):
+                loaded = cs.validate_config(
+                    self._base(scan_secrets=value), "config x"
+                )
+                self.assertEqual(loaded["scan_secrets"], expected)
+
+    def test_scan_secrets_rejects_anything_else(self):
+        with self.assertRaises(cs.ConfigError) as caught:
+            cs.validate_config(self._base(scan_secrets="yes"), "config x")
+        self.assertIn("'scan_secrets' must be true or false", str(caught.exception))
+
+    def test_version_must_be_the_supported_one(self):
+        for data in (
+            {"name": "d", "project": "/p"},
+            self._base(version=2),
+            self._base(version="2"),
+        ):
+            with self.subTest(version=data.get("version")):
+                with self.assertRaises(cs.ConfigError) as caught:
+                    cs.validate_config(data, "config x")
+                self.assertIn("unsupported version", str(caught.exception))
+
+    def test_unknown_keys_are_refused(self):
+        with self.assertRaises(cs.ConfigError) as caught:
+            cs.validate_config(self._base(bogus=1), "config x")
+        self.assertIn("unknown key 'bogus'", str(caught.exception))
+
+    def test_name_and_project_are_required(self):
+        cases = {
+            "missing": {k: v for k, v in self._base().items() if k != "project"},
+            "empty": self._base(name=""),
+            "relative": self._base(project="relative/path"),
+        }
+        for label, data in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(cs.ConfigError):
+                    cs.validate_config(data, "config x")
+
+    def test_relative_optional_paths_are_refused(self):
+        for key in ("env_file", "secrets_settings", "profile_directory"):
+            with self.subTest(key=key):
+                with self.assertRaises(cs.ConfigError) as caught:
+                    cs.validate_config(self._base(**{key: "relative"}), "config x")
+                self.assertIn(key, str(caught.exception))
+                self.assertIn("must be an absolute path", str(caught.exception))
+
+    def test_lists_must_hold_non_empty_strings(self):
+        cases = {
+            "volumes not a list": {"volumes": "x"},
+            "profiles not a list": {"profiles": {"a": 1}},
+            "blank entry": {"volumes": [""]},
+            "non-string entry": {"profiles": [1]},
+        }
+        for label, overrides in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(cs.ConfigError):
+                    cs.validate_config(self._base(**overrides), "config x")
+
+    def test_load_config_reports_a_missing_file(self):
+        with self.assertRaises(cs.ConfigError) as caught:
+            cs.load_config(str(self.root / "absent.yaml"))
+        self.assertIn("failed to read", str(caught.exception))
+
+    def test_load_config_rejects_a_non_mapping_document(self):
+        target = self.root / "list.yaml"
+        target.write_text("- a\n- b\n")
+        with self.assertRaises(cs.ConfigError) as caught:
+            cs.load_config(str(target))
+        self.assertIn("must be a YAML mapping", str(caught.exception))
+
+
+class WriteConfigFileTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_creates_parent_directories_and_writes_the_text(self):
+        target = self.root / "a" / "b" / "demo.yaml"
+        cs.write_config_file(target, "version: 1\n")
+        self.assertEqual(target.read_text(), "version: 1\n")
+        self.assertEqual([entry.name for entry in target.parent.iterdir()],
+                         ["demo.yaml"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_the_file_is_private(self):
+        target = self.root / "demo.yaml"
+        cs.write_config_file(target, "version: 1\n")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+
+class SaveCreatedConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._config = cs.CONFIG
+        self._dry = cs.DRY_RUN
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self._restore)
+        self.root = Path(self._tmp.name)
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.config_dir = self.root / "cfg"
+
+    def _restore(self):
+        cs.CONFIG = self._config
+        cs.DRY_RUN = self._dry
+
+    def _configure(self, *extra):
+        cs.CONFIG = cs.parse_args(
+            ["-n", "demo", "-p", str(self.project),
+             "--config-dir", str(self.config_dir), *extra]
+        )
+
+    def test_dry_run_prints_the_config_and_writes_nothing(self):
+        self._configure()
+        cs.DRY_RUN = True
+        target = self.config_dir / "demo.yaml"
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = cs.save_created_config()
+        self.assertEqual(result, "")
+        self.assertIn(f"Config would be saved: {target}", out.getvalue())
+        self.assertIn("version: 1", out.getvalue())
+        self.assertIn("name: 'demo'", out.getvalue())
+        self.assertFalse(target.exists())
+
+    def test_a_real_run_writes_the_file_and_returns_its_path(self):
+        self._configure()
+        cs.DRY_RUN = False
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = cs.save_created_config()
+        target = self.config_dir / "demo.yaml"
+        self.assertEqual(result, str(target))
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn(f"project: '{self.project}'", target.read_text())
+
+    def test_no_config_writes_nothing(self):
+        self._configure("--no-config")
+        cs.DRY_RUN = False
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = cs.save_created_config()
+        self.assertEqual(result, "")
+        self.assertFalse((self.config_dir / "demo.yaml").exists())
+        self.assertEqual(out.getvalue() + err.getvalue(), "")
+
+    def test_an_unwritable_directory_warns_instead_of_raising(self):
+        blocker = self.root / "blocker"
+        blocker.write_text("not a directory")
+        self._configure()
+        cs.CONFIG.config_dir = str(blocker / "nested")
+        cs.DRY_RUN = False
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            result = cs.save_created_config()
+        self.assertEqual(result, "")
+        self.assertIn("Warning:", err.getvalue())
+        self.assertIn("failed to write", err.getvalue())
+
+
+class AddProfilesToConfigTextTests(unittest.TestCase):
+    """Recording a profile must not reformat or reorder the rest of the file."""
+
+    def test_appends_missing_names_after_the_existing_list(self):
+        text = (
+            "version: 1\n"
+            "name: 'd'\n"
+            "project: '/p'\n"
+            "profiles:\n"
+            "  - 'python'\n"
+            "\n"
+            "# mounts\n"
+            "volumes:\n"
+            "  - '/v'\n"
+        )
+        updated = cs.add_profiles_to_config_text(text, ["node", "python", "rust"])
+        self.assertEqual(
+            updated,
+            "version: 1\n"
+            "name: 'd'\n"
+            "project: '/p'\n"
+            "profiles:\n"
+            "  - 'python'\n"
+            "  - 'node'\n"
+            "  - 'rust'\n"
+            "\n"
+            "# mounts\n"
+            "volumes:\n"
+            "  - '/v'\n",
+        )
+
+    def test_existing_names_are_not_duplicated(self):
+        text = "version: 1\nprofiles:\n  - 'python'\n  - 'node'\n"
+        self.assertEqual(
+            cs.add_profiles_to_config_text(text, ["python", "node"]), text
+        )
+
+    def test_a_profiles_block_is_inserted_when_absent(self):
+        text = "version: 1\nname: 'd'\nproject: '/p'\n"
+        self.assertEqual(
+            cs.add_profiles_to_config_text(text, ["python"]),
+            text + "\nprofiles:\n  - 'python'\n",
+        )
+
+    def test_a_profiles_block_with_no_items_gets_the_names(self):
+        text = "version: 1\nprofiles:\nvolumes:\n  - '/v'\n"
+        self.assertEqual(
+            cs.add_profiles_to_config_text(text, ["python"]),
+            "version: 1\nprofiles:\n  - 'python'\nvolumes:\n  - '/v'\n",
+        )
+
+    def test_an_inline_flow_list_is_rewritten_as_a_block(self):
+        # The dependency-free parser cannot read a flow list, so recording a new
+        # profile must leave the file in the block form it can read.
+        self.assertEqual(
+            cs.add_profiles_to_config_text("profiles: [python, node]\n", ["rust"]),
+            "profiles:\n  - 'python'\n  - 'node'\n  - 'rust'\n",
+        )
+
+    def test_duplicate_names_are_recorded_once(self):
+        self.assertEqual(
+            cs.add_profiles_to_config_text("profiles:\n  - 'python'\n", ["node", "node"]),
+            "profiles:\n  - 'python'\n  - 'node'\n",
+        )
+
+
+class UpdateSavedConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._config = cs.CONFIG
+        self._dry = cs.DRY_RUN
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self._restore)
+        self.root = Path(self._tmp.name)
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.config_dir = self.root / "cfg"
+        self.target = self.config_dir / "demo.yaml"
+        self._configure()
+
+    def _restore(self):
+        cs.CONFIG = self._config
+        cs.DRY_RUN = self._dry
+
+    def _configure(self, *extra):
+        cs.CONFIG = cs.parse_args(
+            ["-n", "demo", "-p", str(self.project),
+             "--config-dir", str(self.config_dir), *extra]
+        )
+
+    def _write_existing(self):
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.target.write_text(
+            cs.render_config({"name": "demo", "project": str(self.project),
+                              "scan_secrets": "true", "profiles": ["python"]})
+        )
+
+    def test_an_existing_config_gets_the_profile_and_is_reported(self):
+        self._write_existing()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cs.update_saved_config(["node"])
+        self.assertIn(f"Config updated: {self.target}", out.getvalue())
+        self.assertEqual(cs.load_config(str(self.target))["profiles"],
+                         ["python", "node"])
+
+    def test_a_missing_config_warns_and_writes_nothing(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            cs.update_saved_config(["node"])
+        self.assertIn("no saved config for sandbox 'demo'", err.getvalue())
+        self.assertFalse(self.target.exists())
+
+    def test_no_config_is_a_no_op(self):
+        self._write_existing()
+        before = self.target.read_text()
+        self._configure("--no-config")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cs.update_saved_config(["node"])
+        self.assertEqual(self.target.read_text(), before)
+        self.assertEqual(out.getvalue() + err.getvalue(), "")
+
+    def test_dry_run_reports_an_existing_file_without_writing(self):
+        self._write_existing()
+        before = self.target.read_text()
+        cs.DRY_RUN = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cs.update_saved_config(["node"])
+        self.assertIn(f"Config would be updated: {self.target}", out.getvalue())
+        self.assertEqual(self.target.read_text(), before)
+
+    def test_dry_run_warns_when_there_is_no_file(self):
+        cs.DRY_RUN = True
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            cs.update_saved_config(["node"])
+        self.assertIn("no saved config for sandbox 'demo'", err.getvalue())
+
+    def test_a_changed_profile_directory_is_recorded(self):
+        # A profile applied from a non-default directory must be replayable by
+        # --recreate, so the directory is recorded with the name.
+        self._write_existing()
+        profile_dir = self.root / "my-profiles"
+        self._configure("-profile-directory", str(profile_dir))
+        cs.update_saved_config(["node"])
+        data = cs.load_config(str(self.target))
+        self.assertEqual(data["profile_directory"], str(profile_dir))
+        self.assertEqual(data["profiles"], ["python", "node"])
+
+    def test_duplicate_names_are_recorded_once(self):
+        self._write_existing()
+        cs.update_saved_config(["node", "node"])
+        self.assertEqual(cs.load_config(str(self.target))["profiles"], ["python", "node"])
+
+
+class ApplyLoadedConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._config = cs.CONFIG
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.CONFIG = self._config
+
+    DATA = {
+        "name": "demo",
+        "project": "/projects/demo",
+        "env_file": "/secrets/sbx.env",
+        "scan_secrets": "false",
+        "secrets_settings": "/secrets/scan.json",
+        "profiles": ["python", "node"],
+        "profile_directory": "/profiles",
+        "volumes": ["/data:rw", "/docs"],
+    }
+
+    def test_every_field_is_copied_into_the_global_config(self):
+        cs.CONFIG = cs.Config()
+        cs.apply_loaded_config(self.DATA)
+        self.assertEqual(cs.CONFIG.name, "demo")
+        self.assertEqual(cs.CONFIG.path, "/projects/demo")
+        self.assertEqual(cs.CONFIG.envfile, "/secrets/sbx.env")
+        self.assertEqual(cs.CONFIG.secrets, "false")
+        self.assertEqual(cs.CONFIG.secretsfile, "/secrets/scan.json")
+        self.assertEqual(cs.CONFIG.profiles, "python,node")
+        self.assertEqual(cs.CONFIG.profile_directory, "/profiles")
+        self.assertEqual(cs.CONFIG.volumes, ["/data:rw", "/docs"])
+
+    def test_a_name_mismatch_aborts_before_anything_is_copied(self):
+        cs.CONFIG = cs.Config()
+        with self.assertRaises(cs.ConfigError) as caught:
+            cs.apply_loaded_config(self.DATA, expected_name="other")
+        message = str(caught.exception)
+        self.assertIn("'demo'", message)
+        self.assertIn("'other'", message)
+        self.assertEqual(cs.CONFIG.name, "")
+        self.assertEqual(cs.CONFIG.path, "")
+
+    def test_a_matching_expected_name_is_accepted(self):
+        cs.CONFIG = cs.Config()
+        cs.apply_loaded_config(self.DATA, expected_name="demo")
+        self.assertEqual(cs.CONFIG.name, "demo")
+
+
+class MainModeTests(unittest.TestCase):
+    """The main() branches for --recreate and --from-config.
+
+    Everything that would touch a real sandbox is patched; these tests assert the
+    commands main() would issue and the messages it prints.
+    """
+
+    def setUp(self):
+        self._config = cs.CONFIG
+        self._dry = cs.DRY_RUN
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(self._restore)
+        self.root = Path(self._tmp.name)
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.config_dir = self.root / "cfg"
+
+    def _restore(self):
+        cs.CONFIG = self._config
+        cs.DRY_RUN = self._dry
+
+    def _saved_config(
+        self, name="s", scan_secrets="false", volumes=(), profiles=(), profile_directory=""
+    ):
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        target = self.config_dir / f"{name}.yaml"
+        target.write_text(
+            cs.render_config({
+                "name": name,
+                "project": str(self.project),
+                "scan_secrets": scan_secrets,
+                "volumes": list(volumes),
+                "profiles": list(profiles),
+                "profile_directory": profile_directory,
+            })
+        )
+        return target
+
+    def test_recreate_without_force_refuses_before_any_sbx_command(self):
+        self._saved_config()
+        err = io.StringIO()
+        with mock.patch.object(cs, "have", return_value=True), mock.patch.object(
+            cs, "existing_sandbox_names", return_value=["s"]
+        ), mock.patch.object(cs, "sbx") as fake_sbx, contextlib.redirect_stdout(
+            io.StringIO()
+        ), contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            cs.main(["-n", "s", "--recreate", "--config-dir", str(self.config_dir)])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("--force", err.getvalue())
+        fake_sbx.assert_not_called()
+
+    def test_recreate_with_force_removes_then_creates_in_order(self):
+        self._saved_config()
+        with mock.patch.object(cs, "have", return_value=True), mock.patch.object(
+            cs, "existing_sandbox_names", return_value=["s"]
+        ), mock.patch.object(cs, "wait_for_sandbox", return_value=True), mock.patch.object(
+            cs, "setup_sandbox"
+        ), mock.patch.object(cs, "update_sbx_policy"), mock.patch.object(
+            cs, "update_sbx_policy_slack"
+        ), mock.patch.object(cs, "update_sbx_policy_nctalk"), mock.patch.object(
+            cs, "apply_profiles"
+        ), mock.patch.object(
+            cs, "save_created_config", return_value=""
+        ), mock.patch.object(cs, "sbx") as fake_sbx, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            rc = cs.main(["-n", "s", "--recreate", "--force",
+                          "--config-dir", str(self.config_dir)])
+        self.assertEqual(rc, 0)
+        calls = [call[0][0] for call in fake_sbx.call_args_list]
+        self.assertEqual(calls[0], ["rm", "s"])
+        self.assertEqual(calls[1], ["create", "--name", "s", "claude", str(self.project)])
+
+    def test_recreate_force_dry_run_echoes_the_removal(self):
+        # --dry-run promises to print every command that would run; the removal is
+        # destructive and therefore the most important one to show.
+        self._saved_config()
+        with mock.patch.object(cs, "sbx") as fake_sbx, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            rc = cs.main(["-n", "s", "--recreate", "--force", "--dry-run",
+                          "--config-dir", str(self.config_dir)])
+        self.assertEqual(rc, 0)
+        calls = [call[0][0] for call in fake_sbx.call_args_list]
+        self.assertEqual(calls[0], ["rm", "s"])
+        self.assertEqual(calls[1][0:2], ["create", "--name"])
+
+    def test_from_config_dry_run_echoes_the_create_command(self):
+        volume = self.root / "data"
+        volume.mkdir()
+        target = self._saved_config(volumes=[f"{volume}:rw"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cs.main(["--from-config", str(target), "--dry-run",
+                          "--config-dir", str(self.config_dir)])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("  $ sbx create --name s claude", text)
+        self.assertIn(str(self.project), text)
+        self.assertIn(str(volume), text)
+
+    def test_a_profile_bundle_cannot_install_managed_files(self):
+        profile_dir = self.root / "profiles"
+        bundle = profile_dir / "bad"
+        bundle.mkdir(parents=True)
+        (bundle / "profile.yaml").write_text(
+            "name: bad\n"
+            "description: installs a managed file\n"
+            "policies:\n"
+            "  network:\n"
+            "    allow:\n"
+            "      - example.com\n"
+        )
+        (bundle / "settings.json").write_text("{}")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            err
+        ), self.assertRaises(SystemExit) as ctx:
+            cs.main(["-n", "s", "-p", str(self.project), "-s", "false",
+                     "--dry-run", "-profile", "bad",
+                     "-profile-directory", str(profile_dir),
+                     "--config-dir", str(self.config_dir)])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("settings.json", err.getvalue())
+        self.assertIn("agent level", err.getvalue())
 
 
 if __name__ == "__main__":

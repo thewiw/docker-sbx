@@ -17,23 +17,27 @@ Scripts that run on the **host** live in the repository root and are run from th
 | `docker-sbx-install.sh` | One-time host setup. Installs Docker CE and the `docker-sbx` engine, creates a `kvm` group user, and sets default network policies (deny-all, allow only Ubuntu archives and Docker download). Must be run with `sudo`. |
 | `docker-sbx-install.py` | Cross-platform replacement for `docker-sbx-install.sh`, runnable on Linux/WSL, macOS and Windows (Python 3.9+, standard library only). Does the same setup: installs or updates Docker, installs the `sbx` CLI, signs in, sets the global network policy, and persists the environment variables. `--dry-run` prints every command and changes nothing, and needs no privilege on any platform. Needs `sudo` on Linux; runs as a regular user on Windows and macOS (Homebrew refuses to run as root). The only Windows step needing administrator rights — enabling the Windows Hypervisor Platform — is probed first and demanded only when the feature is missing. |
 | `docker-sbx-create-sandbox.sh` | Creates a new sandbox for a project. Scans the project for secrets (file patterns + gitleaks), runs `sbx create`, then copies `sandbox/docker-sbx-setup-sandbox.sh` into the sandbox and executes it. Optionally applies per-sandbox policy profiles. |
-| `docker-sbx-create-sandbox.py` | Cross-platform replacement for `docker-sbx-create-sandbox.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options and the same user-facing messages; `--dry-run` prints every command and creates nothing. Profiles are YAML: PyYAML is used when importable, otherwise a small parser covers the documented profile subset. It waits for the new sandbox's first start to finish before configuring it, refuses to reuse an existing sandbox name, and treats a failed `sbx create` as fatal — the bash version's `sbx()` calls are non-fatal (mirroring the original), so a failed create used to be followed by setup against the *previous* sandbox of that name. |
+| `docker-sbx-create-sandbox.py` | Cross-platform replacement for `docker-sbx-create-sandbox.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options and the same user-facing messages; `--dry-run` prints every command and creates nothing. Profiles are YAML: PyYAML is used when importable, otherwise a small parser covers the documented profile subset. A profile is either a flat `<name>.yaml` (network only) or a directory `<name>/` with a `profile.yaml` plus an asset tree (`agent/`, `project/`, and any other root entry at agent level), installed through a host-built tarball. After creating a sandbox it records a per-sandbox config (unless `--no-config`); `--recreate` rebuilds one from its saved config, and `--from-config` creates from a config. It waits for the new sandbox's first start to finish before configuring it, refuses to reuse an existing sandbox name, and treats a failed `sbx create` as fatal — the bash version's `sbx()` calls are non-fatal (mirroring the original), so a failed create used to be followed by setup against the *previous* sandbox of that name. Its `main_update()` is the implementation behind `docker-sbx-apply-profile.py`. |
+| `docker-sbx-apply-profile.py` | Applies policy profiles (network rules and Claude assets) to an existing sandbox: `-n`, `-profile`, `-profile-directory`, `--config-dir`, `--no-config`, `--dry-run`. It never creates a sandbox, never scans for secrets and never re-runs the in-sandbox setup. It reads the saved config for the project path (project-level assets) and for a recorded profile directory, validates every named profile before changing anything, starts/waits for a stopped sandbox, then records the names and the effective directory in the config and prints `Config updated: <path>`. The command is a thin entry point: it loads `docker-sbx-create-sandbox.py` from its own directory (a hyphenated filename cannot be imported by name) and delegates to `main_update()`, so creation and updates share one profile loader, asset packer and config writer. |
 | `sandbox/docker-sbx-setup-sandbox.sh` | Runs **inside** the sandbox, after the host has waited for the sandbox's first start to finish. Takes the project path and an optional env-file path (or `-`). Installs `jq` **only if it is missing** — that is the only `apt` use, and it never kills `apt`/`dpkg` or upgrades packages, because the sandbox runs its own `apt` at boot (`/etc/durable-startup.d/001-startup-claude/001-cmd.sh`) and is still installing its agent during that first start. Writes Claude Code telemetry/opt-out settings into `~/.claude/settings.json`. It deliberately does **not** create a `~/workspace` symlink: the project is already mounted at its host path. Also installs the optional Slack and/or Nextcloud Talk notification hooks when the env file asks for them. The two providers share one body of code here (`write_notify_env`, `wire_notify_hooks`, `hook_var`) parameterised by variable prefix; each has its own installer gated by its own `<PREFIX>_ENABLED`, so a sandbox can run Slack only, Talk only, or both, and each wires its own hook script without disturbing the other. |
 | `sandbox/docker-sbx-slack-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/slack-notify.sh`. Invoked by Claude Code as a hook with the event payload on stdin; posts one short line per lifecycle event to Slack. Only installed when the optional feature is enabled via the env file. |
 | `sandbox/docker-sbx-nctalk-notify.sh` | Runs **inside** the sandbox as `~/.claude/hooks/nctalk-notify.sh`. The Nextcloud Talk counterpart of the Slack hook — same architecture, same event vocabulary and message format — posting via the Talk spreed OCS API (`<url>/ocs/v2.php/apps/spreed/api/v1/chat/<room>`) with the app password as basic auth. All its variables carry the `SBX_NCTALK_` prefix and `SBX_NCTALK_ENABLED` is its master switch. Only installed when the feature is enabled via the env file; independent of the Slack hook. |
 | `docker-sbx-update-sandboxes.sh` | Maintenance helper. Runs `apt update/upgrade/autoremove` inside existing sandboxes via `sbx exec`, one at a time. Enumerates with `sbx ls` (or a custom `SBX_LS_CMD`), selectable with `-i`/`-x`; `DRY_RUN=1` prints instead of running. Not part of sandbox creation. |
 | `docker-sbx-update-sandboxes.py` | Cross-platform replacement for `docker-sbx-update-sandboxes.sh` (Linux/WSL, macOS, Windows; Python 3.9+, standard library only). Same options, the same user-facing messages and the same exit codes (0 clean, 1 when a sandbox fails, 2 on bad usage); adds a `--dry-run` flag alongside `DRY_RUN=1`. Lists sandboxes from `SBX_LS_CMD`, then `sbx ls -q`, then `sbx ls --json`, then the human-readable table — the JSON branch walks the parsed document itself, so `jq` is no longer needed. `SBX_LS_CMD` runs through the platform shell (`sh -c`, or `cmd /c` on Windows); the `sh -c` handed to `sbx exec` stays `sh -c`, since that one runs inside the sandbox. The query timeout (`SBX_TIMEOUT`) is enforced by `subprocess`, **not** by a `timeout(1)` binary: Windows ships an unrelated `timeout.exe` (it *waits* N seconds) under that name, so looking one up by name found it and prefixed every query with `timeout 120 sbx …`, which Windows rejected — every query failed and the script reported "no sandboxes found". A `SBX_TIMEOUT` that is not a positive number now exits 2 before the first query instead of failing each one. |
-| `test/run-tests.sh` | Test suite for the Slack and Nextcloud Talk notification features, the env-file contract and the `create-sandbox` CLI. Exercises the hooks, the settings merge (including both providers enabled together), failure logging, and a real POST to a loopback sink. The CLI-level tests (1-12) now run against the Python implementation only — the bash host script was deleted when the migration completed — but `SBX_IMPLS` still selects, so a checkout that has both runs the same assertions against each and catches them drifting apart. Run directly on the host (`bash test/run-tests.sh`); no sandbox required. |
+| `test/run-tests.sh` | Test suite for the Slack and Nextcloud Talk notification features, the env-file contract and the `create-sandbox` CLI. Exercises the hooks, the settings merge (including both providers enabled together), failure logging, and a real POST to a loopback sink. It also covers the profile-bundle, per-sandbox config and update/recreate/from-config paths — asset tarball assembly, the config round-trip, the apply-profile command, and the create CLI's modes. The CLI-level tests now run against the Python implementation only — the bash host script was deleted when the migration completed — but `SBX_IMPLS` still selects, so a checkout that has both runs the same assertions against each and catches them drifting apart. Run directly on the host (`bash test/run-tests.sh`); no sandbox required. |
 | `test/test_docker_sbx_install.py` | Unit tests for the pure helpers in `docker-sbx-install.py` (prompt parsing, platform/locale selection, profile path, environment-block idempotency). Run with `python3 -m unittest discover -s test -p 'test_*.py'`. |
-| `test/test_create_sandbox.py` | Unit tests for the pure helpers in `docker-sbx-create-sandbox.py` (argument parsing, env-file reading, volume specs, Slack and Nextcloud Talk validation, host extraction, the provider-script staging, the secrets-file scanner, the minimal YAML profile parser, the sandbox-name pre-check and the wait for a sandbox's first start). Same command as above. |
+| `test/test_create_sandbox.py` | Unit tests for the pure helpers in `docker-sbx-create-sandbox.py` (argument parsing and mode selection, env-file reading, volume specs, Slack and Nextcloud Talk validation, host extraction, the provider-script staging, the secrets-file scanner, the minimal YAML profile parser, profile-directory resolution and the asset plan with its refused paths and size cap, the sandbox-config schema and round-trip, the `profiles:` line-surgery merge, the sandbox-name pre-check and the wait for a sandbox's first start). It also covers the update flag validator; the update flow itself lives in `test_apply_profile.py`. Same command as above. |
+| `test/test_apply_profile.py` | Unit tests for `docker-sbx-apply-profile.py` and `main_update()`: argument and help handling, rejection of create-only flags and unknown options, delegation from the entry point (argv and exit code), the missing-implementation error, and the update flow itself — no `sbx create`, config-derived project/profile directory, missing sandbox, failed `sbx` query reported separately from a missing sandbox, and dry-run. Same command as above; no `sbx` and no sandbox. |
 | `test/test_update_sandboxes.py` | Unit tests for the pure helpers in `docker-sbx-update-sandboxes.py` (list normalisation, CLI parsing and its exit-2 messages, the apt chain, exec-flag detection, and the three sandbox-name extraction paths). Same command as above; needs no `sbx` and no sandbox. |
-| `profiles/` | YAML policy profiles used by `docker-sbx-create-sandbox.sh` to grant a sandbox access to language-specific external resources. |
+| `profiles/` | Policy profiles used by `docker-sbx-create-sandbox.py`. The shipped language profiles are flat `<name>.yaml` files granting access to language-specific external resources; `profiles/example/` is a directory bundle that also carries agent- and project-level assets and serves as the copyable template. |
 
 ## Security Model
 
 - **Default network policy**: deny-all. Only `archive.ubuntu.com`, `security.ubuntu.com`, and `download.docker.com` are allowed globally. Explicit deny rules are also set for GitHub, GitLab, Bitbucket, and Postman domains.
 - **Secret scanning**: before a sandbox is created, the script checks for credential files (`google-services.json`, `key.properties`, `*.jks`, `*.cert`, `*.crt`, `*.key`) and runs `gitleaks` against the project's git repository. Creation aborts if secrets are found.
 - **Shared volume**: the project directory is mounted as a shared volume. Claude Code has write access to the entire sandbox filesystem, including this volume. Do not place credentials inside the project path or in git history.
+- **Profile assets**: a selected profile bundle can install arbitrary regular files under `/home/agent/.claude/` and `<project>/.claude/`. Project-level assets are written into the shared volume and are visible on the host, so a bundle is chosen with the same care as the project itself. Symlinks and special files are refused; agent-level `settings.json`, `settings.local.json` and `.credentials.json` are refused (docker-sbx and Claude Code own them), as are project-level `.git` and `.credentials.json`; and a bundle is capped at 2000 files / 32 MiB. Only profiles the user names with `-profile` are installed.
+- **Per-sandbox config**: `<config-dir>/<name>.yaml` records how to rebuild a sandbox. It stores **paths only, never credentials**: `env_file` and `secrets_settings` name the files that hold them. It is written mode `600` where the platform supports it and is editable by hand; `version` is `1`, unknown keys are rejected, and path-valued fields must be absolute.
 - **Slack notifications** (optional): when enabled, the sandbox's own network policy is extended with just the endpoint the configured credential style needs (`hooks.slack.com` for a webhook, `slack.com` for a bot token) — no global rule is added. The credential is written to `~/.claude/hooks/slack.env`, mode `600`, outside the project volume. It is still readable by the agent in that sandbox, so scope the credential to what you are willing to expose there: an incoming webhook bound to a single channel is least privilege, a bot token (`chat:write`) can post anywhere the bot is a member. `docker-sbx-create-sandbox.py` aborts if `SBX_SLACK_ENABLED=true` but no usable target is configured, rather than silently installing a hook that can never deliver.
 - **Nextcloud Talk notifications** (optional): the second provider, independent of Slack. When `SBX_NCTALK_ENABLED=true`, the sandbox's network policy is extended with the Nextcloud instance's host only (from `SBX_NCTALK_URL`) — no global rule. The Nextcloud user, app password and room token are written to `~/.claude/hooks/nctalk.env`, mode `600`, outside the project volume and separate from `slack.env`; the app password is still readable by the agent in that sandbox, so scope it to an account you are willing to expose there — it can act as that user for every API call. Creation aborts, naming the missing variable, if `SBX_NCTALK_ENABLED=true` but `SBX_NCTALK_URL`, `SBX_NCTALK_USER`, `SBX_NCTALK_TOKEN` or `SBX_NCTALK_ROOM` is absent. Slack and Talk may be enabled at the same time.
 
@@ -53,11 +57,99 @@ Scripts that run on the **host** live in the repository root and are run from th
 
 Project files will be available inside the sandbox at the same absolute path they have on the host (`sbx` mounts the project there; a Windows `C:\…` path appears as `/c/…`), and that is where the agent starts. Extra volumes passed via `-v` are reachable at their own absolute host paths. There is no `~/workspace` symlink.
 
+A successful creation ends with `Config saved: <path>` and a ready-to-copy
+`<script> -n <name> --recreate` line, printed by `main()` after `save_created_config()`
+returns the path. Failing to write the config only warns: the sandbox exists and is
+usable, so losing its recreate record is not worth failing the run for.
+
+## Updating a Sandbox
+
+`docker-sbx-apply-profile.py -n NAME -profile LIST` applies profiles to an existing
+sandbox. It is a separate command, not a mode of the create script, so the two have
+unambiguous, focused argument sets; the implementation stays in the create module (exported
+as `main_update()`) so profile loading, asset packing and config writing have one definition.
+
+- It never creates and never scans for secrets, and it does not re-run the in-sandbox setup.
+  Adding a profile must not disturb the state of a live sandbox.
+- The sandbox must already exist. If it is stopped, the readiness probe (`sbx exec`, which
+  Docker documents as starting a stopped sandbox) starts it, and the command waits for that
+  first start to settle before copying anything in — the same reason creation waits.
+- The operation is additive: network rules are added and same-named asset files are
+  overwritten, but nothing is removed or revoked. Un-applying a profile is not supported.
+- Newly applied names are added to the saved config's `profiles:` list, deduplicated and in
+  the order given, and the command prints `Config updated: <path>`. If the sandbox has no
+  saved config it warns and records nothing rather than inventing one: the file would not
+  contain the `project` and other fields needed to recreate the sandbox.
+
+The config rewrite is line surgery on the `profiles:` block, not a parse-and-re-render,
+because the file is documented as hand-editable and a rewrite from the parsed schema would
+drop comments and formatting. It appends only the missing names, deduplicated. An inline
+flow list (`profiles: [a, b]`) is rewritten into the block form, because that is the only
+form the dependency-free parser can read; any other shape it cannot handle falls back to a
+parse-and-re-render, which needs PyYAML for flow collections. A changed
+`-profile-directory` is recorded in the same pass: without it, a later `--recreate` would
+resolve the same profile names against the default `./profiles`.
+
+## Per-sandbox Configuration
+
+Each sandbox gets `<config-dir>/<name>.yaml` after a successful create, unless
+`--no-config` is given. `config_file()` also refuses names containing separators or `.`/`..`,
+so a sandbox name cannot escape the config directory.
+
+Default directory, chosen by `default_config_dir()`:
+
+| Platform | Path |
+|---|---|
+| Linux / WSL | `$XDG_CONFIG_HOME/docker-sbx/sandboxes` (or `~/.config/…`) |
+| macOS | `~/Library/Application Support/docker-sbx/sandboxes` |
+| Windows | `%APPDATA%\docker-sbx\sandboxes` (or `~/AppData/Roaming/…`) |
+
+Schema (`version` is `1`; unknown keys are rejected):
+
+```yaml
+version: 1
+name: test01
+project: /home/me/projects/test01
+env_file: /home/me/private/.anthropic.api.env
+scan_secrets: true
+secrets_settings: /home/me/private/secrets.json
+profiles:
+  - python
+  - node
+profile_directory: /home/me/my-profiles
+volumes:
+  - /mnt/c/docs
+  - /mnt/c/data:rw
+```
+
+- Only paths, never credentials. `project`, `env_file` and `secrets_settings` are absolute
+  when written and are validated as absolute on load — a relative path would silently
+  resolve against whatever directory the recreate ran from.
+- `profile_directory` is omitted when the default `./profiles` is in use, so the file stays
+  portable between checkouts; an explicit or loaded value is stored absolutely.
+- `volumes` keeps each spec as passed, including the optional `[:ro|:rw]`.
+- `render_config()` emits the documented block subset in a stable key order; the file is
+  written atomically (temp file + `os.replace`) and mode `600`, because a crash mid-write
+  would otherwise leave a config that cannot be loaded.
+- The loader uses PyYAML when importable and the minimal parser otherwise, then
+  `validate_config()` normalises types (notably `scan_secrets` to `"true"`/`"false"`).
+
+`--recreate -n NAME` loads the config named by `-n`, checks it describes that same sandbox,
+and then runs the normal creation flow, including the secret scan. It refuses if the sandbox
+still exists; `--force` is the explicit opt-in to `sbx rm` first, for the same reason create
+refuses to reuse a name. `--from-config FILE` does the same from an arbitrary config and is
+mutually exclusive with the creation flags, since the config is the single source for all
+of them. A successful recreate writes the config again, so a hand-edited file stays the
+record of what was built.
+
 ## Policy Profiles
 
-Profiles are YAML files that describe additional **per-sandbox** network policies.
-They are applied after all standard rules, so profile rules take precedence over
-standard rules.
+A profile describes additional **per-sandbox** network policies and, optionally, assets
+copied into the sandbox. It is either a flat `<name>.yaml` file (network rules only) or a
+self-contained directory `<name>/` holding a `profile.yaml` and an asset tree. Profiles are
+applied after all standard rules, so profile rules take precedence over standard rules.
+Defining one name in both forms is an error: a silent precedence rule would make the
+profile that was applied depend on lookup order.
 
 ### Profile format
 
@@ -81,9 +173,56 @@ Rules:
 - Any key/section that would imply a global policy is rejected; profiles are always per-sandbox.
 - Malformed or unknown profiles abort sandbox creation.
 
+### Profile assets
+
+A directory profile may carry files in addition to `profile.yaml`:
+
+| Entry | Installed to |
+|---|---|
+| `agent/` | `/home/agent/.claude/` |
+| `project/` | `<project>/.claude/` |
+| any other root entry (`skills/`, `agents/`, `commands/`, `workflows/`, `CLAUDE.md`, …) | `/home/agent/.claude/<entry>` |
+
+Agent level is the default so a bundle author only writes the tree once; `agent/` and
+`project/` exist to override that for the entries that must land on the other side.
+
+Delivery is: package the selected files into a gzip tarball on the host, `sbx cp` it into
+the guest, unpack it with the guest's `tar`, then delete the archive. Project-level assets
+land in `<project>/.claude/`, which is the shared volume, so they become part of the host
+working tree and not just the sandbox.
+
+Things to keep in mind when editing this feature:
+
+- Build the tarball with Python's `tarfile`, not the host's `tar`: a `tar` binary is not
+  guaranteed on Windows and its flags differ between the GNU and BSD implementations, whereas
+  `tarfile` is standard library everywhere. The archive is assembled from an
+  already-validated file list. Entries are written with `uid`/`gid` 0, empty owner names and
+  `mtime` 0 so the same bundle produces the same archive.
+- Asset delivery is **fatal** on failure (`die`), unlike the `sbx policy` calls around it.
+  A profile that claims to install a skill must not silently install half of it; a policy
+  call that fails is visible on `sbx policy ls`, but a missing asset is not.
+- Symlinks and special files are refused while collecting the tree. The destination is the
+  agent's home or the shared project volume, and a link can point outside both — and out of
+  the volume, where a project-level asset has no business writing.
+- Refuse `settings.json`, `settings.local.json` and `.credentials.json` at agent level:
+  `sandbox/docker-sbx-setup-sandbox.sh` merges its telemetry settings and notification hooks
+  into `settings.json`, so a profile that shipped its own would be overwritten or would
+  overwrite docker-sbx's entries depending on order. At project level only `settings.json`
+  is allowed, because that file belongs to the project; `.git` and `.credentials.json` are
+  still refused.
+- The check is on the first path component, so refusing `settings.json` also refuses
+  `settings.json/…`; a directory cannot be used to smuggle the same name in deeper.
+- Later profiles overwrite earlier same-named files; nothing is deleted, so applying
+  profiles is additive.
+- Cap the bundle at 2000 files / 32 MiB. This is a rail against pointing at a whole
+  checkout by accident, not a considered limit.
+- `profiles/example/` is the template users are meant to copy. The shipped language
+  profiles stay flat and network-only; only a bundle can carry assets.
+
 ### Standard profiles
 
-The `./profiles` directory contains these built-in profiles:
+The `./profiles` directory contains these built-in profiles. They carry network rules only;
+assets require the directory form.
 
 - `python` — PyPI and test PyPI
 - `java` — Maven Central and Gradle repositories

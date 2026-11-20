@@ -175,8 +175,18 @@ python3 docker-sbx-create-sandbox.py -n [sandbox name] -p [absolute path] -e {pa
   -gsf                : generate a default secrets files settings and exit, parameter is path to secrets files settings [[optional]]
   -v                  : extra host directory/file to mount into the sandbox (absolute path) [[optional, repeatable]]
   -profile            : comma-separated list of policy profiles to apply (e.g. python,java) [[optional]]
-  -profile-directory  : directory containing profile YAML files [[optional, default: ./profiles]]
+  -profile-directory  : directory containing profile YAML files and bundles [[optional, default: ./profiles]]
+  --recreate          : rebuild sandbox -n from its saved config (refuses if it already exists)
+  --force             : with --recreate, remove the existing sandbox first (sbx rm)
+  --from-config FILE  : create from a saved config instead of -n/-p/-e/-s/-sf/-v/-profile/-profile-directory
+  --config-dir DIR    : directory holding <sandbox>.yaml config files
+                        [[optional, default: the platform config directory]]
+  --no-config         : do not write a sandbox config file
 ```
+
+A successful creation ends by printing the saved config's path and a ready-to-copy rebuild
+command. That saved config is what `--recreate` uses later; see
+[Per-sandbox configuration](#per-sandbox-configuration).
 
 The setup step **waits for the sandbox's first start to finish** before configuring it. That first
 start is when the guest gets its agent — the `claude` binary is downloaded then, so it can take a
@@ -244,6 +254,28 @@ Use a custom profile directory:
 python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile myprofile -profile-directory $HOME/my-profiles
 ```
 
+Apply another profile to an existing sandbox (no secret scan, no setup re-run):
+```
+python3 docker-sbx-apply-profile.py -n test01 -profile node
+```
+
+Rebuild a sandbox from the config saved when it was created (`--recreate` refuses if the
+sandbox still exists; `--force` removes it first):
+```
+python3 docker-sbx-create-sandbox.py -n test01 --recreate
+python3 docker-sbx-create-sandbox.py -n test01 --recreate --force
+```
+
+Create a sandbox from a saved config, without repeating any of its options:
+```
+python3 docker-sbx-create-sandbox.py --from-config $HOME/.config/docker-sbx/sandboxes/test01.yaml
+```
+
+Keep sandbox configs somewhere other than the default directory:
+```
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 --config-dir $HOME/sbx-configs
+```
+
 Mount an extra directory read-only and another one read-write:
 ```
 python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -v /mnt/c/docs -v /mnt/c/data:rw
@@ -276,11 +308,15 @@ ANTHROPIC_AUTH_TOKEN=ollama
 
 By default every sandbox shares the same restrictive network policy. A **profile** adds
 extra **per-sandbox** network rules, so a project that needs PyPI or npm can reach it
-without opening that domain up for every sandbox.
+without opening that domain up for every sandbox. A profile can also carry **assets** —
+skills, commands, agents, workflows or a `CLAUDE.md` — that are copied into the sandbox.
 
-Profiles are YAML files in the `./profiles` directory (or the directory given with
-`-profile-directory`) and are selected with `-profile`. They are applied after all
-standard rules, so profile rules take precedence.
+A profile is either a flat `<name>.yaml` file (network rules only, as before) or a
+self-contained directory `<name>/` holding a `profile.yaml` plus an asset tree. Profiles
+live in the `./profiles` directory (or the directory given with `-profile-directory`) and
+are selected with `-profile`. They are applied after all standard rules, so profile rules
+take precedence over standard rules. Defining the same name both as a directory and as a
+flat YAML file is an error rather than a silent precedence rule.
 
 ### Profile format
 
@@ -304,7 +340,45 @@ Rules:
 - Any key that would imply a global policy is rejected; profiles are always per-sandbox.
 - Malformed or unknown profiles abort sandbox creation.
 
+A directory profile uses exactly the same schema in its `profile.yaml`; the directory also
+carries assets.
+
+### Profile assets
+
+Everything in a profile directory is an asset except the definition file. The layout is:
+
+| Path in the profile directory | Installed to |
+|---|---|
+| `profile.yaml` / `profile.yml` | – (the definition itself, never copied) |
+| `agent/` | `/home/agent/.claude/` |
+| `project/` | `<project>/.claude/` |
+| any other root entry (`skills/`, `agents/`, `commands/`, `workflows/`, `CLAUDE.md`, …) | `/home/agent/.claude/<entry>` |
+
+Top-level entries outside `agent/` and `project/` are therefore agent-level by default.
+
+Rules:
+
+- Profiles are applied in the order given; a later profile overwrites files with the same
+  name.
+- Symbolic links and special files are refused.
+- At agent level, `settings.json`, `settings.local.json` and `.credentials.json` may not be
+  installed; at project level, `settings.json` is allowed but `.git` and `.credentials.json`
+  are not.
+- An asset bundle is capped at 2000 files and 32 MiB.
+- If assets cannot be installed, creation (or `docker-sbx-apply-profile.py`) aborts rather
+  than leaving a half-installed profile.
+
+Assets are packaged on the host and copied into the sandbox, then unpacked with the guest's
+`tar`. Project-level assets are written to `<project>/.claude/` inside the shared volume, so
+they are visible on the host as well.
+
+`profiles/example/` is a copyable template for a directory profile: it installs one skill
+at agent level and one command at project level, and defines no network rules. The shipped
+language profiles below remain flat, network-only files.
+
 ### Standard profiles
+
+These profiles carry network rules only; a profile directory may additionally carry assets.
 
 | Profile | Grants access to |
 |---|---|
@@ -324,6 +398,92 @@ python3 docker-sbx-create-sandbox.py -n pyproject -p "$HOME/projects/pyproject" 
 python3 docker-sbx-create-sandbox.py -n spring -p "$HOME/projects/spring" -profile java-spring-boot
 python3 docker-sbx-create-sandbox.py -n fullstack -p "$HOME/projects/fullstack" -profile python,node
 ```
+
+
+## Update a sandbox
+
+`docker-sbx-apply-profile.py` applies `-profile` to a sandbox that already exists, without
+creating it and without repeating its creation options:
+
+```
+python3 docker-sbx-apply-profile.py -n [sandbox name] -profile [profile names] [-options] :
+  -n                  : sandbox to update [[mandatory]]
+  -profile            : comma-separated profiles to apply, in order [[mandatory]]
+  -profile-directory  : directory containing profile YAML files and bundles [[optional, default: ./profiles]]
+  --config-dir DIR    : directory holding <sandbox>.yaml config files [[optional]]
+  --no-config         : do not update the sandbox's saved config
+  --dry-run           : print every command that would run, and change nothing
+```
+
+Examples:
+```
+python3 docker-sbx-apply-profile.py -n test01 -profile node
+python3 docker-sbx-apply-profile.py -n test01 -profile python,node -profile-directory $HOME/my-profiles
+```
+
+- It is **additive only**: network rules are added and asset files are written (overwriting
+  same-named files), but nothing is removed or revoked.
+- There is no secret scan and the in-sandbox setup is not run again. The sandbox must
+  already exist; if it is stopped, it is started and the command waits for it to finish
+  starting before copying anything in.
+- The applied profile names are recorded in the sandbox's saved config (see below),
+  deduplicated and in the order given. On success it prints `Config updated: <path>`. If
+  the sandbox has no saved config, it warns and records nothing.
+
+
+## Per-sandbox configuration
+
+Every successful creation writes a YAML config describing how to rebuild that sandbox
+(unless `--no-config` is given), so `--recreate` and `--from-config` do not need the
+original command line. The default location is:
+
+| Platform | Directory |
+|---|---|
+| Linux / WSL | `~/.config/docker-sbx/sandboxes/` (`XDG_CONFIG_HOME` is honoured) |
+| macOS | `~/Library/Application Support/docker-sbx/sandboxes/` |
+| Windows | `%APPDATA%\docker-sbx\sandboxes\` |
+
+`--config-dir DIR` overrides it. At the end of a successful creation the script prints
+`Config saved: <path>`, followed by a ready-to-copy `--recreate` command.
+
+```yaml
+version: 1
+name: test01
+project: /home/me/projects/test01
+env_file: /home/me/private/.anthropic.api.env
+scan_secrets: true
+secrets_settings: /home/me/private/secrets.json
+profiles:
+  - python
+  - node
+profile_directory: /home/me/my-profiles
+volumes:
+  - /mnt/c/docs
+  - /mnt/c/data:rw
+```
+
+- The file stores **paths only, never credentials**. `project`, `env_file` and
+  `secrets_settings` are stored as absolute paths; the credential values themselves still
+  live in the files those paths name.
+- `profile_directory` is omitted when the default `./profiles` is in use, so the file stays
+  portable between checkouts.
+- Volume entries keep their `path[:ro|:rw]` form exactly as passed with `-v`.
+- The file is plain YAML and can be edited by hand. `version` is `1`; unknown keys are
+  rejected when the file is loaded. The script writes, and the dependency-free parser reads,
+  the block form shown above; flow lists such as `profiles: [python]` need PyYAML installed
+  (they are rewritten to block form when `docker-sbx-apply-profile.py` records a new name).
+- `--no-config` suppresses writing it, and suppresses the update
+  `docker-sbx-apply-profile.py` would otherwise make to it.
+
+`--recreate` loads this file and rebuilds the sandbox; it refuses if the sandbox already
+exists, and `--force` runs `sbx rm` first. `--from-config FILE` creates from any saved
+config (it is mutually exclusive with `-n`, `-p`, `-e`, `-s`, `-sf`, `-v`, `-profile` and
+`-profile-directory`, which the config already contains). Both go through the normal
+creation flow, including the secret scan.
+
+Because a config can point at credential files, treat it with the same care as the command
+line that produced it. Project-level profile assets are written into the shared project
+volume and are therefore visible on the host.
 
 
 ## Notifications (optional)
