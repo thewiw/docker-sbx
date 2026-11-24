@@ -62,8 +62,9 @@ text="${text//\'/}"
 shopt -s nocasematch
 
 protected=(
-  'GoogleService-Info.plist'
+  'key.properties'
   'google-services.json'
+  'GoogleService-Info.plist'
   'launch.json'
 )
 

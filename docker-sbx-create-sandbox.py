@@ -59,8 +59,9 @@ SANDBOX_READY_POLL = 5
 SANDBOX_READY_REPORT = 30
 
 DEFAULT_SEARCH_PATTERNS = (
-    "google-services.json",
     "key.properties",
+    "google-services.json",
+    "GoogleService-Info.plist",
     "*.jks",
     "*.cert",
     "*.crt",
