@@ -1022,10 +1022,15 @@ class ProfileParserTests(unittest.TestCase):
     # The values the shipped profiles must produce, spelled out so a change in the
     # parser (or a profile) is visible rather than silently absorbed.
     FLUTTER_ALLOW = [
+        # `flutter upgrade` fetches from the SDK's GitHub remote; Gradle's
+        # distribution download redirects through GitHub to a release asset.
+        "github.com", "release-assets.githubusercontent.com",
+        "objects.githubusercontent.com",
         "pub.dev", "storage.googleapis.com",
         "dl.google.com", "dl-ssl.google.com", "maven.google.com",
         "repo.maven.apache.org", "repo1.maven.org",
-        "plugins.gradle.org", "services.gradle.org", "downloads.gradle.org",
+        "plugins.gradle.org", "plugins-artifacts.gradle.org",
+        "services.gradle.org", "downloads.gradle.org",
     ]
     EXPECTED = {
         "python.yaml": ["pypi.org", "files.pythonhosted.org", "test.pypi.org"],
@@ -1269,6 +1274,54 @@ class ShippedFlutterKitTests(unittest.TestCase):
             "ANDROID_HOME=/opt/android-sdk",
         ):
             self.assertIn(needle, dockerfile)
+
+
+class ApplyProfilesTests(unittest.TestCase):
+    def _apply(self, allowed, denied=()):
+        source = cs.ProfileSource("demo", Path("demo.yaml"))
+        with mock.patch.object(cs, "name", return_value="s"), mock.patch.object(
+            cs, "profiles", return_value="demo"
+        ), mock.patch.object(cs, "profile_directories", return_value=[]), mock.patch.object(
+            cs, "load_profile_sources", return_value=[(source, list(allowed), list(denied))]
+        ), mock.patch.object(cs, "sbx") as fake_sbx, contextlib.redirect_stdout(io.StringIO()):
+            cs.apply_profiles()
+        return [call[0][0] for call in fake_sbx.call_args_list]
+
+    def test_a_legacy_code_host_clears_the_global_and_local_denies(self):
+        # Deny beats allow, and a *global* deny outranks a per-sandbox allow.
+        # The legacy install deny is removed too, then the local one, then the
+        # allow. --force suppresses the CLI's confirmation prompt.
+        calls = self._apply(["github.com"])
+        self.assertEqual(
+            calls,
+            [
+                ["policy", "rm", "network", "--resource", "github.com", "--force"],
+                ["policy", "rm", "network", "--sandbox", "s",
+                 "--resource", "github.com", "--force"],
+                ["policy", "allow", "network", "--sandbox", "s", "github.com"],
+            ],
+        )
+
+    def test_an_ordinary_host_only_clears_the_sandbox_deny(self):
+        # A global deny the user added themselves is not a profile's business.
+        calls = self._apply(["good.example.com"])
+        self.assertEqual(
+            calls,
+            [
+                ["policy", "rm", "network", "--sandbox", "s",
+                 "--resource", "good.example.com", "--force"],
+                ["policy", "allow", "network", "--sandbox", "s", "good.example.com"],
+            ],
+        )
+
+    def test_a_profile_deny_is_still_added_after_the_allows(self):
+        calls = self._apply(["good.example.com"], ["bad.example.com"])
+        self.assertEqual(
+            calls[1], ["policy", "allow", "network", "--sandbox", "s", "good.example.com"]
+        )
+        self.assertEqual(
+            calls[2], ["policy", "deny", "network", "--sandbox", "s", "bad.example.com"]
+        )
 
 
 class ModeSelectionTests(unittest.TestCase):

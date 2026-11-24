@@ -100,14 +100,20 @@ WIN32_OPTIONAL_FEATURE_STATES = {
 }
 
 # Global network policy, applied once at install time. Sandboxes are allowed to
-# do system updates; the deny list names the code hosts explicitly so it keeps
-# holding even if the default policy is changed later.
+# do system updates. Do NOT add a code host here: the deny-all preset is the
+# real default (a sandbox reaches nothing else unless its own profile allows
+# it), and a *global* deny outranks every per-sandbox allow. Denying GitHub
+# globally broke the shipped `go` and `flutter` profiles, which must reach
+# GitHub/GitLab/Bitbucket, so those rules are now removed rather than added.
 ALLOW_DOMAINS = "archive.ubuntu.com,security.ubuntu.com,download.docker.com"
-DENY_DOMAINS = (
+# No shipped profile grants Postman, so this one is safe to keep global.
+DENY_DOMAINS = ("postman.com",)
+# Older installs denied the code hosts globally. They are removed on the next
+# run, because a global deny cannot be overridden by a profile's allow.
+LEGACY_DENY_DOMAINS = (
     "github.com,github.org",
     "gitlab.com,gitlab.org",
     "atlassian.com,atlassian.net,bitbucket.com,bitbucket.org",
-    "postman.com",
 )
 
 ENV_MARKER = "# docker-sbx setup env"
@@ -788,6 +794,17 @@ def setup_sbx_policy() -> None:
     for domains in DENY_DOMAINS:
         info(f"  denying {domains}")
         run_sbx(["policy", "deny", "network", domains], check=False)
+
+    # Idempotent migration from installs that denied code hosts globally:
+    # removing a rule that is not there is harmless, and capturing the output
+    # keeps the "no such rule" reply out of an otherwise short banner.
+    info("  removing legacy global code-host denies")
+    for domains in LEGACY_DENY_DOMAINS:
+        run_sbx(
+            ["policy", "rm", "network", "--resource", domains, "--force"],
+            check=False,
+            capture=True,
+        )
 
 
 # --------------------------------------------------------------------------

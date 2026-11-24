@@ -47,6 +47,14 @@ capabilities:
           - security.ubuntu.com
       runtime:
         allow:
+          # `flutter upgrade` fetches the SDK's git remote from GitHub, and the
+          # Gradle wrapper's distribution download redirects through GitHub to
+          # a release-asset host. A deny rule takes precedence over a kit's
+          # allow, so the profile applied at creation also removes the legacy
+          # global and sandbox-local GitHub deny.
+          - github.com
+          - release-assets.githubusercontent.com
+          - objects.githubusercontent.com
           - pub.dev
           - storage.googleapis.com
           - dl.google.com
@@ -55,6 +63,9 @@ capabilities:
           - repo.maven.apache.org
           - repo1.maven.org
           - plugins.gradle.org
+          # Plugin Portal artifacts are served from this redirect target; a
+          # portal-only allow returns 403 for Kotlin/Gradle Kotlin plugins.
+          - plugins-artifacts.gradle.org
           - services.gradle.org
           - downloads.gradle.org
   - type: com.docker.sandbox/lifecycle@1

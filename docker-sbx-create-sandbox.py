@@ -222,9 +222,13 @@ def have(command: str) -> bool:
     return shutil.which(command) is not None
 
 
-def sbx(args, *, check: bool = False):
-    """Run `sbx <args>`. Most sbx calls are reported, not fatal, by their caller."""
-    return run(["sbx", *args], check=check)
+def sbx(args, *, check: bool = False, capture: bool = False):
+    """Run `sbx <args>`. Most sbx calls are reported, not fatal, by their caller.
+
+    `capture` keeps a probe-like call's "no such rule" chatter out of the output;
+    the caller decides what its return code means.
+    """
+    return run(["sbx", *args], check=check, capture=capture)
 
 
 def script_dir() -> Path:
@@ -1736,6 +1740,18 @@ def update_sbx_policy_nctalk() -> None:
 # --------------------------------------------------------------------------
 
 
+# A *global* deny outranks a per-sandbox allow, so no profile can make one of
+# these hosts reachable while the global rule exists. Older installs created
+# global denies for the code hosts; these are the ones a shipped profile grants,
+# so applying such a profile removes the stray global rule. A global deny the
+# user added for any other host is deliberately left untouched.
+LEGACY_GLOBAL_DENIES = {
+    "github.com", "github.org",
+    "gitlab.com", "gitlab.org",
+    "atlassian.com", "atlassian.net", "bitbucket.com", "bitbucket.org",
+}
+
+
 class ProfileError(Exception):
     """A profile that cannot be parsed or is not shaped as a per-sandbox policy."""
 
@@ -2338,7 +2354,24 @@ def apply_profiles() -> None:
             # profile's network rules and Claude assets still apply here.
             info(f"  sandbox kit: {source.kit_path} (applied at creation)")
 
+        # Deny wins over allow, including over a profile's allow, so the allows
+        # below are ineffective until a matching deny is gone. Clear both shapes:
+        # a legacy global rule for the code hosts (which a per-sandbox allow can
+        # never override) and any sandbox-local copy. An arbitrary global deny
+        # is not touched; only the known install defaults are removed.
+        if allowed:
+            info("  clearing denies that would mask the profile")
         for domain in allowed:
+            if domain in LEGACY_GLOBAL_DENIES:
+                sbx(
+                    ["policy", "rm", "network", "--resource", domain, "--force"],
+                    capture=True,
+                )
+            sbx(
+                ["policy", "rm", "network", "--sandbox", name(),
+                 "--resource", domain, "--force"],
+                capture=True,
+            )
             info(f"  allowing {domain}")
             sbx(["policy", "allow", "network", "--sandbox", name(), domain])
         for domain in denied:

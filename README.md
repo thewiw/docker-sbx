@@ -361,6 +361,16 @@ first, then directory bundles; both are applied after all standard rules, so pro
 rules take precedence over standard rules. Defining the same name both as a directory
 and as a flat YAML file is an error rather than a silent precedence rule.
 
+A deny rule beats an allow rule inside the effective policy, and a **global** deny
+outranks a per-sandbox allow. So for every domain a profile **allows**, applying it first
+removes a **sandbox-local** deny for that domain and, for the code hosts the installer
+used to deny globally (GitHub, GitLab, Bitbucket), the stray legacy **global** rule too
+(`sbx policy rm network … --force`, since the CLI prompts). Then it adds the allow. This
+is what makes `github.com` reachable for `flutter upgrade` and Gradle's distribution
+download. An arbitrary global deny the user added is left alone. The installer no longer
+creates code-host denies and removes them on its next run; the deny-all preset still
+blocks every host a sandbox has not been granted.
+
 A directory profile may declare `kit: <dir>`, where `<dir>` is a single directory name
 inside the profile bundle. That directory is passed to `sbx create --kit` at creation, so
 the toolchain it describes is built into the sandbox image. The kit directory is **not**
@@ -459,7 +469,7 @@ and a sandbox kit.
 | `node` | npm and Yarn registries |
 | `rust` | crates.io |
 | `dotnet` | NuGet.org |
-| `flutter` | Flutter/Dart package access plus Android build dependencies (network only) |
+| `flutter` | Flutter/Dart package access plus Android build dependencies, and `github.com` for `flutter upgrade` (network only) |
 | `flutter-sdk` | `flutter`'s network rules **and** a sandbox kit with Flutter, Dart, JDK 17 and the Android SDK |
 
 `flutter-sdk` builds the toolchain into the sandbox image at creation. It requires
@@ -469,6 +479,10 @@ no official linux-arm64 release tarball) and supports `flutter analyze`, `flutte
 toolchain (clang, CMake, Ninja, pkg-config, GTK 3) is installed at creation when missing.
 It does **not** include the Android emulator (local sandboxes have no nested KVM), iOS
 builds, or the web/Chrome toolchain.
+`flutter upgrade` (run by `docker-sbx-update-sandboxes.py`) fetches the SDK's git remote
+from `github.com`, and a Gradle wrapper download redirects through GitHub to a release
+asset host; the profile allows those hosts and clears the legacy global and sandbox-local
+default denies when it is applied. A global deny you added yourself is left alone.
 The first creation builds and downloads several GB; later sandboxes reuse the cached build.
 The saved config records `flutter-sdk`, so `--recreate` rebuilds it. Kits are an
 **experimental** `sbx` feature: v3 kits need sbx 0.45 or later, and 0.47+ is recommended.
@@ -866,6 +880,11 @@ With no arguments it updates every module in every sandbox returned by `sbx ls`.
 sandbox without the `flutter-sdk` kit still refreshes cleanly. A module whose command
 fails is reported and makes the sandbox count as failed, but it does not stop the
 modules after it.
+
+`flutter upgrade` fetches the SDK's git remote from `github.com`, and Gradle's wrapper
+download redirects through GitHub to a release-asset host. The `flutter` and `flutter-sdk`
+profiles allow those hosts and, when applied, clear the legacy global and sandbox-local
+default denies. An arbitrary global deny you added yourself is left alone.
 
 ```
 python3 docker-sbx-update-sandboxes.py                       # every sandbox, every module

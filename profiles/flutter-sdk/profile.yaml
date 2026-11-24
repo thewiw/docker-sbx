@@ -9,6 +9,13 @@ policies:
     # the two profiles grant the same hosts, so a new dependency cannot be added
     # to one and forgotten in the other.
     allow:
+      # `flutter upgrade` fetches the SDK's git remote from GitHub, and the
+      # Gradle wrapper's distribution download redirects through GitHub to a
+      # release-asset host. A deny rule would win over this allow, so applying
+      # the profile also clears the legacy global and sandbox-local denies.
+      - github.com
+      - release-assets.githubusercontent.com
+      - objects.githubusercontent.com
       # Dart/Flutter package resolution
       - pub.dev
       - storage.googleapis.com
@@ -19,5 +26,9 @@ policies:
       - repo.maven.apache.org
       - repo1.maven.org
       - plugins.gradle.org
+      # The Plugin Portal redirects artifact downloads here; allowing only
+      # plugins.gradle.org gets a 403 for org.gradle.kotlin / org.jetbrains.kotlin
+      # plugin dependencies.
+      - plugins-artifacts.gradle.org
       - services.gradle.org
       - downloads.gradle.org

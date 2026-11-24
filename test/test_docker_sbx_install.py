@@ -376,6 +376,26 @@ class HypervisorPlatformTests(unittest.TestCase):
         fake_run.assert_not_called()
 
 
+class GlobalPolicyTests(unittest.TestCase):
+    def test_code_host_denies_are_removed_not_added(self):
+        # A global deny outranks a profile's per-sandbox allow, so an install
+        # that re-added it would break the go/flutter profiles again.
+        with mock.patch.object(install, "set_default_policy"), mock.patch.object(
+            install, "run_sbx"
+        ) as fake_run, contextlib.redirect_stdout(io.StringIO()):
+            install.setup_sbx_policy()
+        commands = [call[0][0] for call in fake_run.call_args_list]
+
+        self.assertIn(["policy", "allow", "network", install.ALLOW_DOMAINS], commands)
+        self.assertIn(["policy", "deny", "network", "postman.com"], commands)
+        for domains in install.LEGACY_DENY_DOMAINS:
+            self.assertIn(
+                ["policy", "rm", "network", "--resource", domains, "--force"], commands
+            )
+        rendered = " ".join(" ".join(command) for command in commands)
+        self.assertNotIn("deny network github.com", rendered)
+
+
 class AdminGateInMainTests(unittest.TestCase):
     """--dry-run changes nothing, so main() must not gate it behind privilege."""
 
