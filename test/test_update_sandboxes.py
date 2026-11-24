@@ -56,6 +56,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cfg.sudo, "sudo")
         self.assertEqual(cfg.sbx_timeout, "120")
         self.assertFalse(cfg.show_help)
+        self.assertEqual(cfg.modules_raw, "")
+        self.assertEqual(cfg.modules, list(us.MODULES))
 
     def test_help_flags(self):
         self.assertTrue(us.parse_args(["-h"], env={}).show_help)
@@ -99,6 +101,30 @@ class CliTests(unittest.TestCase):
                 us.parse_args(argv, env={})
             self.assertEqual(str(ctx.exception), f"missing sandbox list after {argv[0]}")
 
+    def test_modules_forms(self):
+        for argv in (["-m", "claude,flutter"], ["--modules", "claude,flutter"],
+                     ["--modules=claude,flutter"]):
+            cfg = us.parse_args(argv, env={})
+            self.assertEqual(cfg.modules, ["claude", "flutter"], argv)
+
+    def test_modules_missing_value_exits_2(self):
+        for argv in (["-m"], ["--modules"]):
+            with self.assertRaises(us.UsageError) as ctx:
+                us.parse_args(argv, env={})
+            self.assertEqual(str(ctx.exception), f"missing module list after {argv[0]}")
+
+    def test_modules_repeatable_and_merged_with_env(self):
+        cfg = us.parse_args(["-m", "flutter", "-m", "claude"], env={"MODULES": "system"})
+        self.assertEqual(cfg.modules, ["system", "claude", "flutter"])
+
+    def test_unknown_module_exits_2(self):
+        with self.assertRaises(us.UsageError) as ctx:
+            us.parse_args(["-m", "system,nope"], env={})
+        self.assertEqual(
+            str(ctx.exception),
+            "unknown module: nope (valid modules: system, claude, flutter)",
+        )
+
     def test_positional_argument_exits_2(self):
         with self.assertRaises(us.UsageError) as ctx:
             us.parse_args(["bc"], env={})
@@ -141,6 +167,76 @@ class ConfigTests(unittest.TestCase):
 
     def test_explicit_exec_flags_win(self):
         self.assertEqual(us.detect_exec_flags("-i --env X=1", True, True), "-i --env X=1")
+
+
+class ModuleTests(unittest.TestCase):
+    def test_default_selects_every_module_in_order(self):
+        self.assertEqual(us.select_modules([]), ["system", "claude", "flutter"])
+
+    def test_canonical_order_and_deduplication(self):
+        # Input order is a set; apt always runs before the agent and toolchain.
+        self.assertEqual(us.select_modules(["flutter", "system", "claude"]),
+                         ["system", "claude", "flutter"])
+        self.assertEqual(us.select_modules(["claude", "claude"]), ["claude"])
+
+    def test_full_chain_has_all_modules_and_status_wrapper(self):
+        chain = us.build_update_chain(us.Config({}), list(us.MODULES))
+        self.assertTrue(chain.startswith("rc=0\n"))
+        self.assertTrue(chain.endswith("exit $rc"))
+        self.assertIn("apt-get update", chain)
+        self.assertIn('"$CLAUDE_BIN" update', chain)
+        self.assertIn('"$FLUTTER_BIN" upgrade', chain)
+
+    def test_only_selected_modules_are_emitted(self):
+        chain = us.build_update_chain(us.Config({}), ["claude"])
+        self.assertIn('"$CLAUDE_BIN" update', chain)
+        self.assertNotIn("apt-get", chain)
+        self.assertNotIn("FLUTTER", chain)
+
+    def test_system_chain_stops_on_first_failed_apt_step(self):
+        # A failed `apt update` must not be followed by upgrade/autoremove.
+        chain = us.build_update_chain(us.Config({}), ["system"])
+        self.assertIn("{ echo '==> system: apt update'", chain)
+        self.assertIn("apt-get -y autoremove; } || rc=1", chain)
+
+    def test_claude_resolves_non_login_paths(self):
+        # A non-login exec does not inherit ~/.local/bin, so the install
+        # locations are tested directly (same probe as the create script).
+        chain = us.build_update_chain(us.Config({}), ["claude"])
+        self.assertIn("command -v claude", chain)
+        self.assertIn('"$HOME/.local/bin/claude"', chain)
+        self.assertIn('"$HOME/.claude/local/claude"', chain)
+        self.assertIn("not installed, skipping", chain)
+
+    def test_flutter_skips_when_absent_and_has_kit_fallback(self):
+        chain = us.build_update_chain(us.Config({}), ["flutter"])
+        self.assertIn("command -v flutter", chain)
+        self.assertIn("/opt/flutter/bin/flutter", chain)
+        self.assertIn("not installed, skipping", chain)
+
+    def test_a_failing_module_marks_the_chain_failed_but_continues(self):
+        # Both failing commands set rc=1; there is no `&&` between modules.
+        chain = us.build_update_chain(us.Config({}), ["claude", "flutter"])
+        self.assertEqual(chain.count("|| rc=1"), 2)
+
+    def test_custom_apt_chain_is_wrapped_and_only_used_for_system(self):
+        cfg = us.Config({"APT_CHAIN": "echo custom"})
+        self.assertIn("{ echo custom; } || rc=1",
+                      us.build_update_chain(cfg, ["system"]))
+        self.assertNotIn("echo custom", us.build_update_chain(cfg, ["claude"]))
+
+    def test_dry_run_prints_the_selected_modules(self):
+        out = io.StringIO()
+        with mock.patch.object(us, "sbx_run") as query, \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = us.main(["-i", "bc", "-m", "claude", "--dry-run"])
+        self.assertEqual(rc, 0)
+        query.assert_called()  # version + daemon status preflight only
+        text = out.getvalue()
+        self.assertIn("modules: claude", text)
+        self.assertIn('"$CLAUDE_BIN" update', text)
+        self.assertNotIn("apt-get update", text)
 
 
 class NameExtractionTests(unittest.TestCase):

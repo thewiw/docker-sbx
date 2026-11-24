@@ -210,8 +210,8 @@ it and then configures the sandbox.
 
 Nothing `docker-sbx` does inside a sandbox kills `apt`/`dpkg` or runs `apt upgrade`: only `jq` is
 installed, and only when it is actually missing (the template ships it). To refresh a sandbox's
-packages after the fact, use `docker-sbx-update-sandboxes.py`, which runs on a sandbox that is
-already up.
+OS packages, Claude Code and (when installed) Flutter after the fact, use
+`docker-sbx-update-sandboxes.py`, which runs on a sandbox that is already up.
 
 Extra volumes passed with `-v` are mounted **read-only by default**; append `:rw` to mount read-write (or `:ro` to be explicit). Each path is mounted inside the sandbox at the same absolute path it has on the host. Repeat `-v` for several mounts.
 
@@ -852,21 +852,39 @@ Run `sbx exec -ti [sandbox name] bash` if you need to take a look or fix somethi
 
 ## Update sandboxes
 
-`docker-sbx-update-sandboxes.py` refreshes the OS packages inside existing sandboxes:
-for each one it runs `sudo apt update`, then `sudo apt upgrade -y`, then
-`sudo apt autoremove -y`. With no arguments it processes every sandbox returned by
-`sbx ls`.
+`docker-sbx-update-sandboxes.py` refreshes the toolchain inside existing sandboxes. It
+runs these modules in order, in one `sbx exec` per sandbox:
+
+| Module | What it runs |
+|---|---|
+| `system` | `sudo apt update`, `sudo apt upgrade -y`, `sudo apt autoremove -y` |
+| `claude` | `claude update` |
+| `flutter` | `flutter upgrade` |
+
+With no arguments it updates every module in every sandbox returned by `sbx ls`.
+`claude` and `flutter` are skipped with a message when they are not installed, so a
+sandbox without the `flutter-sdk` kit still refreshes cleanly. A module whose command
+fails is reported and makes the sandbox count as failed, but it does not stop the
+modules after it.
 
 ```
-python3 docker-sbx-update-sandboxes.py                       # every sandbox
+python3 docker-sbx-update-sandboxes.py                       # every sandbox, every module
 python3 docker-sbx-update-sandboxes.py -i bc,web-1           # only bc and web-1
 python3 docker-sbx-update-sandboxes.py -x bc,web-1           # all except bc and web-1
 python3 docker-sbx-update-sandboxes.py -i bc,web-1 -x bc     # bc is skipped (exclusions win)
+python3 docker-sbx-update-sandboxes.py -m claude,flutter     # skip OS packages
+python3 docker-sbx-update-sandboxes.py -m system             # OS packages only
 ```
 
 `-i`/`--include` and `-x`/`--exclude` take a comma- or space-separated list and are
 repeatable. When you pass `-i`, the sandbox list is never fetched — useful when listing
 is slow or unreliable.
+
+`-m`/`--modules` takes a comma- or space-separated subset of `system`, `claude` and
+`flutter`, and is repeatable. Modules always run in that canonical order regardless of
+the order given, duplicates collapse, and an unknown name is rejected (exit 2) rather
+than silently updating nothing. Like the sandbox lists, it is merged with an
+environment variable (`MODULES`).
 
 The recommended invocation wraps it in `script`, because `sbx` wants a real TTY:
 
@@ -879,6 +897,7 @@ Useful environment variables (all optional):
 | Variable | Default | Purpose |
 |---|---|---|
 | `DRY_RUN=1` | `0` | Print the command that would run for each sandbox; change nothing. |
+| `MODULES` | all | Same as `-m`: e.g. `MODULES="system claude"`. |
 | `CLOUD=1` | `0` | Target cloud sandboxes (adds the global `--cloud` option). |
 | `SBX_TIMEOUT` | `120` | Seconds allowed per query call (`sbx ls`, `version`, `daemon status`). The script enforces it itself; a value that is not a positive number stops the run. |
 | `SBX_EXEC_FLAGS` | auto | Force the `sbx exec` flags instead of auto-detecting (`-ti` on a TTY, else `-i`). |

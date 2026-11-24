@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Refresh packages inside sbx (Docker Sandbox) environments - cross-platform.
+"""Refresh a sandbox's toolchain - cross-platform.
 
-For each sandbox it runs, in one `sbx exec` call:
+For each sandbox it runs the selected update modules in one `sbx exec` call, in
+this order:
 
-    sudo apt update  ->  sudo apt upgrade -y  ->  sudo apt autoremove -y
+    system    sudo apt update -> sudo apt upgrade -y -> sudo apt autoremove -y
+    claude    claude update                     (skipped when not installed)
+    flutter   flutter upgrade                   (skipped when not installed)
+
+With no -m/--modules every module runs. A module that is installed but whose
+command fails marks the sandbox as failed; a module that is not installed is
+reported and skipped, not treated as an error (a sandbox without the
+flutter-sdk kit is still refreshed).
 
 This is the cross-platform successor to docker-sbx-update-sandboxes.sh, which was
 Linux-only (it leaned on an unquoted bash array for the exec flags and on
@@ -16,6 +24,8 @@ Usage:
     python3 docker-sbx-update-sandboxes.py -i bc,web-1             # only these
     python3 docker-sbx-update-sandboxes.py -x bc,web-1             # all except these
     python3 docker-sbx-update-sandboxes.py -i bc,web-1 -x bc       # bc filtered out
+    python3 docker-sbx-update-sandboxes.py -m claude,flutter       # only those modules
+    python3 docker-sbx-update-sandboxes.py -m system               # OS packages only
     python3 docker-sbx-update-sandboxes.py --help
 
 Recommended invocation (sbx wants a real TTY):
@@ -49,6 +59,11 @@ def warn(msg: str) -> None:
     print(f"Warning: {msg}", file=sys.stderr)
 
 
+# Update modules, in the order they run. `-m` selects a subset of this tuple;
+# it never reorders: system first, then the agent, then the SDK toolchain.
+MODULES = ("system", "claude", "flutter")
+
+
 # --------------------------------------------------------------------------
 # 0. Usage
 # --------------------------------------------------------------------------
@@ -58,7 +73,7 @@ def usage_text() -> str:
     program = Path(sys.argv[0]).name
     return "\n".join(
         [
-            f"Usage: {program} [--help] [--dry-run] [-i LIST] [-x LIST]",
+            f"Usage: {program} [--help] [--dry-run] [-i LIST] [-x LIST] [-m LIST]",
             "",
             "With no -i, every sandbox returned by 'sbx ls -q' is refreshed.",
             "With -i, only the listed sandboxes are processed and 'sbx ls' is never",
@@ -70,6 +85,10 @@ def usage_text() -> str:
             "  -x, --exclude LIST   comma- or space-separated sandbox names to SKIP.",
             "                       Repeatable. Merged with the SKIP_LIST env var.",
             "                       Exclusions win over inclusions.",
+            "  -m, --modules LIST   comma- or space-separated modules to UPDATE.",
+            f"                       Valid modules: {', '.join(MODULES)}.",
+            "                       Repeatable. Merged with the MODULES env var.",
+            "                       Omit it to update every module.",
             "",
             "  --dry-run            print what would run, change nothing (same as DRY_RUN=1)",
             "",
@@ -78,6 +97,7 @@ def usage_text() -> str:
             "  DRY_RUN=1              print what would run, change nothing",
             '  INCLUDE="a b"          same as -i, for env-based configuration',
             '  SKIP_LIST="a b"        same as -x, for env-based configuration',
+            '  MODULES="system"       same as -m, for env-based configuration',
             "  SBX_TIMEOUT=120        seconds allowed per query call",
             "  SBX_EXEC_FLAGS=-ti     force exec flags instead of auto-detection",
             "  SBX_LS_CMD='...'       custom listing command (names on stdout)",
@@ -106,9 +126,10 @@ class Config:
 
     def __init__(self, env=None) -> None:
         env = os.environ if env is None else env
-        # Seeded from the environment, then extended by -i / -x.
+        # Seeded from the environment, then extended by -i / -x / -m.
         self.include_raw = env.get("INCLUDE", "")
         self.exclude_raw = env.get("SKIP_LIST", "")
+        self.modules_raw = env.get("MODULES", "")
         self.dry_run = env.get("DRY_RUN", "0")
         self.cloud = env.get("CLOUD", "0")
         self.apt = env.get("APT", "apt-get")  # script-friendly; 'apt' also works
@@ -121,6 +142,7 @@ class Config:
         # Normalised once, after parsing.
         self.include = []
         self.exclude = []
+        self.modules = []
 
 
 def normalize_list(raw: str):
@@ -169,12 +191,22 @@ def parse_args(argv, env=None) -> Config:
             cfg.exclude_raw += " " + argv[index]
             index += 1
             continue
+        if arg.startswith("--modules="):
+            cfg.modules_raw += " " + arg[len("--modules=") :]
+            continue
+        if arg in ("--modules", "-m"):
+            if index >= len(argv):
+                raise UsageError(f"missing module list after {arg}")
+            cfg.modules_raw += " " + argv[index]
+            index += 1
+            continue
         if arg.startswith("-"):
             raise UsageError(f"unknown option: {arg}")
         raise UsageError(f"unexpected argument: {arg} (use -i/--include to name sandboxes)")
 
     cfg.include = normalize_list(cfg.include_raw)
     cfg.exclude = normalize_list(cfg.exclude_raw)
+    cfg.modules = select_modules(normalize_list(cfg.modules_raw))
     return cfg
 
 
@@ -186,19 +218,76 @@ def parse_args(argv, env=None) -> Config:
 # gets its own $SUDO prefix. The env assignment must come AFTER sudo (sudo parses
 # it for the command); 'DEBIAN_FRONTEND=... sudo apt' would have the variable
 # stripped by sudo's env_reset.
-#
-# The run-aligned padding is kept verbatim from the bash assignment: the shell does
-# not care about it, but --dry-run prints this string, and matching it keeps the
-# bash and Python dry runs diffable line for line.
 APT_CHAIN_TEMPLATE = (
-    "echo '==> sudo apt update'        && $SUDO DEBIAN_FRONTEND=noninteractive $APT update         && "
-    "echo '==> sudo apt upgrade'       && $SUDO DEBIAN_FRONTEND=noninteractive $APT -y upgrade     && "
-    "echo '==> sudo apt autoremove'    && $SUDO DEBIAN_FRONTEND=noninteractive $APT -y autoremove"
+    "echo '==> system: apt update' && "
+    "$SUDO DEBIAN_FRONTEND=noninteractive $APT update && "
+    "echo '==> system: apt upgrade' && "
+    "$SUDO DEBIAN_FRONTEND=noninteractive $APT -y upgrade && "
+    "echo '==> system: apt autoremove' && "
+    "$SUDO DEBIAN_FRONTEND=noninteractive $APT -y autoremove"
 )
+
+# Claude Code is not on PATH in a non-login `sbx exec` (the sandbox template
+# exports ~/.local/bin from its startup hook), so the binary is resolved the same
+# way docker-sbx-create-sandbox.py's readiness probe does it: by testing the
+# known install locations directly. `command -v` still comes first, so a PATH
+# that does carry it wins.
+CLAUDE_MODULE = """\
+if command -v claude >/dev/null 2>&1; then
+  CLAUDE_BIN=claude
+elif [ -x "$HOME/.local/bin/claude" ]; then
+  CLAUDE_BIN="$HOME/.local/bin/claude"
+elif [ -x "$HOME/.claude/local/claude" ]; then
+  CLAUDE_BIN="$HOME/.claude/local/claude"
+else
+  CLAUDE_BIN=
+fi
+if [ -n "$CLAUDE_BIN" ]; then
+  echo '==> claude: update'
+  "$CLAUDE_BIN" update || rc=1
+else
+  echo '==> claude: not installed, skipping'
+fi"""
+
+# The flutter-sdk kit installs to /opt/flutter/bin and puts it on the image PATH,
+# which a non-login exec inherits. The absolute path is the fallback for an exec
+# whose PATH was overridden. Flutter is optional and may be absent.
+FLUTTER_MODULE = """\
+if command -v flutter >/dev/null 2>&1; then
+  FLUTTER_BIN=flutter
+elif [ -x /opt/flutter/bin/flutter ]; then
+  FLUTTER_BIN=/opt/flutter/bin/flutter
+else
+  FLUTTER_BIN=
+fi
+if [ -n "$FLUTTER_BIN" ]; then
+  echo '==> flutter: upgrade'
+  "$FLUTTER_BIN" upgrade || rc=1
+else
+  echo '==> flutter: not installed, skipping'
+fi"""
+
+
+def select_modules(requested):
+    """The requested subset of MODULES, in canonical order. Empty means all.
+
+    Duplicates collapse and input order is ignored, so `-m flutter,system` and
+    `-m system,flutter` run identically (apt first). An unknown name is refused
+    rather than silently ignored, since a typo would otherwise update nothing.
+    """
+    if not requested:
+        return list(MODULES)
+    unknown = [name for name in requested if name not in MODULES]
+    if unknown:
+        raise UsageError(
+            f"unknown module: {unknown[0]} (valid modules: {', '.join(MODULES)})"
+        )
+    wanted = set(requested)
+    return [name for name in MODULES if name in wanted]
 
 
 def build_apt_chain(cfg: Config) -> str:
-    """The in-sandbox command string, with $SUDO and $APT already substituted.
+    """The system module's command string, with $SUDO and $APT substituted.
 
     bash expands those two in the `${APT_CHAIN:-...}` default, so the value handed
     to `sbx exec` always has the concrete prefix and package manager in it.
@@ -206,6 +295,31 @@ def build_apt_chain(cfg: Config) -> str:
     if cfg.apt_chain:
         return cfg.apt_chain
     return APT_CHAIN_TEMPLATE.replace("$SUDO", cfg.sudo).replace("$APT", cfg.apt)
+
+
+def build_module_chain(cfg: Config, module: str) -> str:
+    """One module's shell fragment.
+
+    Each fragment on failure sets `rc=1` instead of aborting, so a broken apt
+    run does not stop the agent update and a failed `claude update` does not stop
+    Flutter. build_update_chain() turns that accumulated status into the exit
+    code of the whole `sh -c`.
+    """
+    if module == "system":
+        # A group, so a failed `apt update` skips upgrade/autoremove rather than
+        # running them anyway. A custom APT_CHAIN is wrapped the same way.
+        return "{ " + build_apt_chain(cfg) + "; } || rc=1"
+    if module == "claude":
+        return CLAUDE_MODULE
+    if module == "flutter":
+        return FLUTTER_MODULE
+    raise AssertionError(f"unhandled module: {module}")
+
+
+def build_update_chain(cfg: Config, modules) -> str:
+    """The whole in-sandbox script for the selected modules, in canonical order."""
+    parts = [build_module_chain(cfg, module) for module in modules]
+    return "\n".join(["rc=0", *parts, "exit $rc"])
 
 
 def build_sbx(cfg: Config):
@@ -416,9 +530,12 @@ def main(argv=None) -> int:
 
     sbx = build_sbx(cfg)
     exec_flags = detect_exec_flags(cfg.sbx_exec_flags, sys.stdin.isatty(), sys.stdout.isatty())
-    apt_chain = build_apt_chain(cfg)
+    update_chain = build_update_chain(cfg, cfg.modules)
 
-    info(f"Preflight (exec flags: {exec_flags}, sudo prefix: '{cfg.sudo}')")
+    info(
+        f"Preflight (exec flags: {exec_flags}, sudo prefix: '{cfg.sudo}', "
+        f"modules: {' '.join(cfg.modules)})"
+    )
     sbx_run(cfg, sbx, ["version"])
     sbx_run(cfg, sbx, ["daemon", "status"])
 
@@ -453,11 +570,13 @@ def main(argv=None) -> int:
         info(f"== {sandbox} ==")
 
         if cfg.dry_run == "1":
+            info(f"   modules: {' '.join(cfg.modules)}")
             info(f"   would run: {' '.join(sbx)} exec {exec_flags} {sandbox} sh -c")
-            info(f"   {apt_chain}")
+            for line in update_chain.splitlines():
+                info(f"   {line}")
             continue
 
-        returncode = sbx_exec(sbx, exec_flags, sandbox, apt_chain)
+        returncode = sbx_exec(sbx, exec_flags, sandbox, update_chain)
         if returncode == 0:
             ok += 1
         else:
