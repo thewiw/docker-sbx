@@ -41,6 +41,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cfg.name, "demo")
         self.assertEqual(cfg.path, "/tmp/x")
         self.assertEqual(cfg.secrets, "true")
+        self.assertEqual(cfg.protected_paths, "true")
         self.assertEqual(cfg.volumes, [])
         self.assertFalse(cfg.dry_run)
 
@@ -48,15 +49,65 @@ class CliTests(unittest.TestCase):
         cfg = cs.parse_args(["-n", "d", "-p", "/x", "-v", "/a", "-v", "/b:rw"])
         self.assertEqual(cfg.volumes, ["/a", "/b:rw"])
 
+    def test_long_option_aliases(self):
+        cfg = cs.parse_args(
+            ["-name", "demo", "-project", "/x", "-env", "f.env",
+             "-scan-secrets", "false", "-volume", "/a", "-volume", "/b:rw"]
+        )
+        self.assertEqual(cfg.name, "demo")
+        self.assertEqual(cfg.path, "/x")
+        self.assertEqual(cfg.envfile, "f.env")
+        self.assertEqual(cfg.secrets, "false")
+        self.assertEqual(cfg.volumes, ["/a", "/b:rw"])
+
+    def test_long_option_aliases_accept_equals(self):
+        cfg = cs.parse_args(["-name=demo", "-project=/x", "-scan-secrets=false"])
+        self.assertEqual((cfg.name, cfg.path, cfg.secrets), ("demo", "/x", "false"))
+
+    def test_the_old_secrets_alias_is_rejected(self):
+        with self.assertRaises(cs.CliError) as caught:
+            cs.parse_args(["-n", "d", "-p", "/x", "-secrets", "false"])
+        self.assertIn("Unknown option: -secrets", str(caught.exception))
+
+    def test_repeatable_profiles(self):
+        cfg = cs.parse_args(
+            ["-n", "d", "-p", "/x", "-profile-policy", "python",
+             "-profile-policy", "node", "-profile-directory", "flutter-sdk",
+             "-profile-directory", "bundled"]
+        )
+        self.assertEqual(cfg.profiles, "python,node")
+        self.assertEqual(cfg.profile_directories, ["flutter-sdk", "bundled"])
+
     def test_all_value_options(self):
         cfg = cs.parse_args(
             ["-n", "d", "-p", "/x", "-e", "f.env", "-s", "false", "-sf", "s.json",
-             "-profile", "python", "-profile-directory", "/p"]
+             "-profile-policy", "python", "-profile-directory", "flutter-sdk",
+             "-profiles-dir", "/p"]
         )
         self.assertEqual(
-            (cfg.envfile, cfg.secrets, cfg.secretsfile, cfg.profiles, cfg.profile_directory),
-            ("f.env", "false", "s.json", "python", "/p"),
+            (
+                cfg.envfile, cfg.secrets, cfg.secretsfile,
+                cfg.profiles, cfg.profile_directories, cfg.profiles_dir,
+            ),
+            ("f.env", "false", "s.json", "python", ["flutter-sdk"], "/p"),
         )
+
+    def test_protected_paths_accepts_space_and_equals_forms(self):
+        for argv, expected in (
+            (["-n", "d", "-p", "/x"], "true"),
+            (["-n", "d", "-p", "/x", "-protected-paths", "false"], "false"),
+            (["-n", "d", "-p", "/x", "-protected-paths=false"], "false"),
+            (["-n", "d", "-p", "/x", "-protected-paths=TRUE"], "TRUE"),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(cs.parse_args(argv).protected_paths, expected)
+
+    def test_old_profile_alias_is_rejected(self):
+        for flag in ("-profile", "-prf", "--profile"):
+            with self.subTest(flag=flag):
+                with self.assertRaises(cs.CliError) as caught:
+                    cs.parse_args(["-n", "d", "-p", "/x", flag, "python"])
+                self.assertIn("Unknown option", str(caught.exception))
 
     def test_help_flags(self):
         self.assertTrue(cs.parse_args(["-h"]).show_help)
@@ -84,8 +135,42 @@ class CliTests(unittest.TestCase):
 
     def test_usage_text_mentions_the_documented_flags(self):
         text = cs.usage_text()
-        for needle in ("Usage:", "-sf", "-gsf", "-profile", "-v path", "--dry-run"):
+        for needle in (
+            "Usage:", "-sf", "-gsf", "-protected-paths", "-profile-policy",
+            "-profile-directory", "-profiles-dir", "flutter-sdk", "-v", "-volume",
+            "-name", "-project", "-env", "-scan-secrets", "--dry-run",
+        ):
             self.assertIn(needle, text)
+
+
+    def test_usage_text_lists_available_profiles_with_descriptions(self):
+        text = cs.usage_text()
+        self.assertIn("Available profiles in", text)
+        self.assertIn("Policy profiles (-profile-policy):", text)
+        self.assertIn("Directory profiles (-profile-directory):", text)
+        self.assertIn("python", text)
+        self.assertIn("Python package development", text)
+        self.assertIn("flutter-sdk", text)
+        self.assertIn("Flutter + Dart + Android SDK toolchain", text)
+
+    def test_usage_text_lists_the_profiles_dir_it_was_given(self):
+        previous = cs.CONFIG.profiles_dir
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "demo.yaml").write_text(
+            "name: demo\ndescription: Demo policy description\n"
+        )
+        (root / "bundle").mkdir()
+        (root / "bundle" / "profile.yaml").write_text(
+            "name: bundle\ndescription: Demo bundle description\n"
+        )
+        cs.CONFIG.profiles_dir = str(root)
+        self.addCleanup(lambda: setattr(cs.CONFIG, "profiles_dir", previous))
+        text = cs.usage_text()
+        self.assertIn(f"Available profiles in {root}:", text)
+        self.assertIn("Demo policy description", text)
+        self.assertIn("Demo bundle description", text)
 
 
 class UnquoteTests(unittest.TestCase):
@@ -519,6 +604,48 @@ class CreateSandboxTests(unittest.TestCase):
         self.assertEqual(argv[0][-1], "/docs:ro")
         self.assertTrue(kwargs["check"])
 
+    def test_creation_shows_the_selected_profile_kinds(self):
+        cs.CONFIG = cs.parse_args(
+            ["-n", "d", "-p", "/x", "-profile-policy", "python",
+             "-profile-directory", "flutter-sdk"]
+        )
+        out = io.StringIO()
+        with mock.patch.object(
+            cs, "existing_sandbox_names", return_value=[]
+        ), mock.patch.object(cs, "sbx"), contextlib.redirect_stdout(out):
+            cs.create_sandbox([])
+        text = out.getvalue()
+        self.assertIn("Creating sandbox d", text)
+        self.assertIn("Policy profiles: python", text)
+        self.assertIn("Directory profiles: flutter-sdk", text)
+
+    def test_a_profile_kit_is_passed_to_sbx_create(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "demo" / "kit").mkdir(parents=True)
+        (root / "demo" / "profile.yaml").write_text(
+            "name: demo\nkit: kit\npolicies:\n  network:\n    allow:\n      - pypi.org\n"
+        )
+        (root / "demo" / "kit" / "demo.yaml").write_text(
+            "# syntax=docker/sandbox-kit:3\nschemaVersion: \"3\"\nkind: mixin\n"
+        )
+        cs.CONFIG = cs.parse_args(
+            ["-n", "d", "-p", "/x", "-profile-directory", "demo",
+             "-profiles-dir", str(root)]
+        )
+        with mock.patch.object(
+            cs, "existing_sandbox_names", return_value=[]
+        ), mock.patch.object(cs, "sbx") as fake_sbx, contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            cs.create_sandbox([])
+        argv = fake_sbx.call_args[0][0]
+        self.assertIn("--kit", argv)
+        self.assertEqual(
+            argv[argv.index("--kit") + 1], str((root / "demo" / "kit").resolve())
+        )
+
     def test_an_existing_name_is_refused_before_anything_is_created(self):
         err = io.StringIO()
         with mock.patch.object(
@@ -571,6 +698,43 @@ class NCTalkStagingTests(unittest.TestCase):
         calls = self._stage(self.SLACK + self.TALK)
         self.assertIn("slack-notify.sh", calls)
         self.assertIn("nctalk-notify.sh", calls)
+
+
+class ProtectedPathStagingTests(unittest.TestCase):
+    """The guard is staged by default and its flag reaches the setup script."""
+
+    def setUp(self):
+        self._config = cs.CONFIG
+        self._dry = cs.DRY_RUN
+        cs.DRY_RUN = False
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        cs.CONFIG = self._config
+        cs.DRY_RUN = self._dry
+
+    def _calls(self, *extra):
+        cs.CONFIG = cs.parse_args(["-n", "d", "-p", "/x", *extra])
+        with mock.patch.object(cs, "wait_for_sandbox", return_value=True), \
+             mock.patch.object(cs, "sbx") as fake_sbx, \
+             contextlib.redirect_stdout(io.StringIO()):
+            cs.setup_sandbox()
+        return [call[0][0] for call in fake_sbx.call_args_list]
+
+    def test_the_guard_is_staged_and_enabled_by_default(self):
+        calls = self._calls()
+        guard = str(cs.script_dir() / "sandbox" / "docker-sbx-guard-protected-paths.sh")
+        self.assertIn(["cp", guard, "d:/home/agent/guard-protected-paths.sh"], calls)
+        setup = [call for call in calls if "bash" in call][0]
+        self.assertEqual(setup[-1], "true")
+
+    def test_the_guard_can_be_disabled(self):
+        calls = self._calls("-protected-paths", "false")
+        self.assertFalse(
+            [call for call in calls if "guard-protected-paths.sh" in " ".join(call)]
+        )
+        setup = [call for call in calls if "bash" in call][0]
+        self.assertEqual(setup[-1], "false")
 
 
 class SandboxReadinessTests(unittest.TestCase):
@@ -660,8 +824,9 @@ class SandboxReadinessTests(unittest.TestCase):
         # <path> -.
         calls, tmp = self._setup_calls()
         bash = [call for call in calls if "bash" in call][0]
-        self.assertEqual(bash[-2], tmp)
-        self.assertEqual(bash[-1], "-")
+        self.assertEqual(bash[-3], tmp)
+        self.assertEqual(bash[-2], "-")
+        self.assertEqual(bash[-1], "true")  # protected paths default
 
     def test_env_file_path_comes_second(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -674,8 +839,9 @@ class SandboxReadinessTests(unittest.TestCase):
                 cs.setup_sandbox()
             calls = [call[0][0] for call in fake_sbx.call_args_list]
         bash = [call for call in calls if "bash" in call][0]
-        self.assertEqual(bash[-2], tmp)  # project path first
-        self.assertEqual(bash[-1], "/home/agent/sbx.env")  # env-file path second
+        self.assertEqual(bash[-3], tmp)  # project path first
+        self.assertEqual(bash[-2], "/home/agent/sbx.env")  # env-file path second
+        self.assertEqual(bash[-1], "true")  # protected paths default
         self.assertTrue(any("cp" in call for call in calls))
 
     def test_a_sandbox_that_never_starts_is_not_configured(self):
@@ -702,6 +868,22 @@ class RunHelperTests(unittest.TestCase):
 
     def _restore(self):
         cs.DRY_RUN = self._dry
+
+    def test_sbx_commands_are_not_echoed(self):
+        out = io.StringIO()
+        with mock.patch.object(
+            cs.subprocess, "run", return_value=mock.Mock(returncode=0)
+        ), contextlib.redirect_stdout(out):
+            cs.run(["sbx", "ls", "-q"], check=False, capture=True)
+        self.assertNotIn("$ sbx", out.getvalue())
+
+    def test_dry_run_still_echoes_sbx_commands(self):
+        # --dry-run's whole purpose is to print the commands it would run.
+        cs.DRY_RUN = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cs.run(["sbx", "create", "--name", "d", "claude", "/x"])
+        self.assertIn("$ sbx create", out.getvalue())
 
     def test_missing_binary_dies_with_a_message(self):
         err = io.StringIO()
@@ -839,6 +1021,12 @@ class DockerDaemonHintTests(unittest.TestCase):
 class ProfileParserTests(unittest.TestCase):
     # The values the shipped profiles must produce, spelled out so a change in the
     # parser (or a profile) is visible rather than silently absorbed.
+    FLUTTER_ALLOW = [
+        "pub.dev", "storage.googleapis.com",
+        "dl.google.com", "dl-ssl.google.com", "maven.google.com",
+        "repo.maven.apache.org", "repo1.maven.org",
+        "plugins.gradle.org", "services.gradle.org", "downloads.gradle.org",
+    ]
     EXPECTED = {
         "python.yaml": ["pypi.org", "files.pythonhosted.org", "test.pypi.org"],
         "node.yaml": [
@@ -847,29 +1035,48 @@ class ProfileParserTests(unittest.TestCase):
         ],
         "rust.yaml": ["crates.io", "static.crates.io"],
         "dotnet.yaml": ["nuget.org", "api.nuget.org"],
-        "flutter.yaml": ["pub.dev", "storage.googleapis.com"],
+        "flutter.yaml": FLUTTER_ALLOW,
     }
 
-    def _load(self, name):
+    def _definition(self, name):
         path = REPO / "profiles" / name
-        return cs.validate_profile(cs.parse_profile_minimal(path.read_text(), str(path)), str(path))
+        if path.is_dir():
+            return path / "profile.yaml", path
+        return path, None
+
+    def _load(self, name):
+        definition, assets_root = self._definition(name)
+        data = cs.parse_profile_minimal(definition.read_text(), str(definition))
+        return cs.validate_profile(data, str(definition), assets_root)
 
     def test_every_shipped_profile_parses(self):
-        profiles = sorted((REPO / "profiles").glob("*.y*ml"))
-        self.assertTrue(profiles, "no profiles found")
-        for path in profiles:
-            with self.subTest(profile=path.name):
-                allowed, denied = cs.validate_profile(
-                    cs.parse_profile_minimal(path.read_text(), str(path)), str(path)
+        flat = sorted((REPO / "profiles").glob("*.y*ml"))
+        bundles = sorted((REPO / "profiles").glob("*/profile.y*ml"))
+        self.assertTrue(flat, "no profiles found")
+        self.assertTrue(bundles, "no profile bundles found")
+        for definition in flat + bundles:
+            with self.subTest(profile=str(definition.relative_to(REPO))):
+                assets_root = definition.parent if definition.parent != REPO / "profiles" else None
+                allowed, denied, _kit = cs.validate_profile(
+                    cs.parse_profile_minimal(definition.read_text(), str(definition)),
+                    str(definition),
+                    assets_root,
                 )
-                self.assertTrue(allowed, f"{path.name} produced no allow rules")
+                if definition.parent.name != "example":
+                    self.assertTrue(allowed, f"{definition} produced no allow rules")
                 self.assertEqual(denied, [])
 
     def test_expected_allow_lists(self):
         for name, expected in self.EXPECTED.items():
             with self.subTest(profile=name):
-                allowed, _ = self._load(name)
+                allowed, _denied, _kit = self._load(name)
                 self.assertEqual(allowed, expected)
+
+    def test_flutter_sdk_profile_reuses_the_flutter_network_rules(self):
+        flutter_allowed, _denied, _kit = self._load("flutter.yaml")
+        sdk_allowed, _denied, kit = self._load("flutter-sdk")
+        self.assertEqual(sdk_allowed, flutter_allowed)
+        self.assertEqual(kit, "flutter")
 
     def test_a_profile_with_deny_and_comments(self):
         text = (
@@ -883,9 +1090,12 @@ class ProfileParserTests(unittest.TestCase):
             "    deny:\n"
             '      - "bad.example.com"\n'
         )
-        allowed, denied = cs.validate_profile(cs.parse_profile_minimal(text, "t"), "t")
+        allowed, denied, kit = cs.validate_profile(
+            cs.parse_profile_minimal(text, "t"), "t"
+        )
         self.assertEqual(allowed, ["good.example.com"])
         self.assertEqual(denied, ["bad.example.com"])
+        self.assertEqual(kit, "")
 
     def test_empty_document_is_an_empty_mapping(self):
         self.assertEqual(cs.parse_profile_minimal("", "t"), {})
@@ -949,12 +1159,29 @@ class ProfileParserTests(unittest.TestCase):
             "      - sub.example.co.uk\n"
             "      - 192.0.2.10\n"
         )
-        allowed, denied = cs.validate_profile(cs.parse_profile_minimal(text, "t"), "t")
+        allowed, denied, _kit = cs.validate_profile(
+            cs.parse_profile_minimal(text, "t"), "t"
+        )
         self.assertEqual(
             allowed,
             ["example.com", "*.example.com", "sub.example.co.uk", "192.0.2.10"],
         )
         self.assertEqual(denied, [])
+
+    def test_kit_rejections(self):
+        cases = {
+            "flat profile": ("kit: kit\n", None),
+            "empty value": ('kit: ""\n', None),
+            "path escape": ("kit: ../kit\n", None),
+            "nested path": ("kit: sdk/kit\n", None),
+            "not a string": ("kit:\n  x: y\n", None),
+        }
+        for label, (text, assets_root) in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(cs.ProfileError):
+                    cs.validate_profile(
+                        cs.parse_profile_minimal(text, "t"), "t", assets_root
+                    )
 
     def test_parser_errors_are_prefixed_with_the_profile(self):
         # load_profile is what the CLI calls; it must name the offending file.
@@ -969,6 +1196,79 @@ class ProfileParserTests(unittest.TestCase):
         with self.assertRaises(cs.ProfileError) as caught:
             cs.load_profile(str(path))
         self.assertIn(str(path), str(caught.exception))
+
+
+class ProfileKitTests(unittest.TestCase):
+    """A directory profile may name a kit directory inside its own bundle."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        (self.root / "kit").mkdir()
+
+    def _validate(self, text, assets_root=None):
+        return cs.validate_profile(
+            cs.parse_profile_minimal(text, "t"), "t", self.root if assets_root is None else assets_root
+        )
+
+    def test_a_kit_directory_is_accepted_when_it_has_a_descriptor(self):
+        (self.root / "kit" / "tool.yaml").write_text("# syntax=docker/sandbox-kit:3\n")
+        _allowed, _denied, kit = self._validate("kit: kit\n")
+        self.assertEqual(kit, "kit")
+
+    def test_a_missing_kit_directory_is_refused(self):
+        with self.assertRaises(cs.ProfileError) as caught:
+            self._validate("kit: nope\n")
+        self.assertIn("not found", str(caught.exception))
+
+    def test_a_kit_directory_without_a_descriptor_is_refused(self):
+        (self.root / "kit" / "README.md").write_text("no descriptor\n")
+        with self.assertRaises(cs.ProfileError) as caught:
+            self._validate("kit: kit\n")
+        self.assertIn("no kit descriptor", str(caught.exception))
+
+    def test_the_kit_directory_is_not_an_asset(self):
+        (self.root / "profile.yaml").write_text("name: t\nkit: kit\n")
+        (self.root / "kit" / "tool.yaml").write_text("name: tool\n")
+        (self.root / "kit" / "tool.dockerfile").write_text("FROM scratch\n")
+        (self.root / "CLAUDE.md").write_text("hi\n")
+        agent, project = cs.profile_asset_plan(self.root, "kit")
+        self.assertEqual([entry[0] for entry in agent + project], ["CLAUDE.md"])
+
+
+class ShippedFlutterKitTests(unittest.TestCase):
+    """The shipped kit is pinned and self-contained; guard against accidental loss."""
+
+    def test_descriptor_and_dockerfile_carry_the_pins(self):
+        kit = REPO / "profiles" / "flutter-sdk" / "flutter"
+        descriptor = (kit / "flutter.yaml").read_text()
+        dockerfile = (kit / "flutter.dockerfile").read_text()
+        for needle in (
+            "# syntax=docker/sandbox-kit:3",
+            'schemaVersion: "3"',
+            "kind: mixin",
+            'default: "3.50.1"',
+            'default: "36"',
+            'default: "36.0.0"',
+            'default: "15859902"',
+            "com.docker.sandbox/network-policy@1",
+            "clang cmake ninja-build pkg-config libgtk-3-dev mesa-utils libglu1-mesa",
+        ):
+            self.assertIn(needle, descriptor)
+        for domain in ProfileParserTests.FLUTTER_ALLOW:
+            with self.subTest(domain=domain):
+                self.assertIn(domain, descriptor)
+        for needle in (
+            "FROM eclipse-temurin:17-jdk-jammy AS jdk",
+            "FROM debian:trixie-slim",
+            "TARGETARCH",
+            "flutter precache --android",
+            "FROM scratch",
+            "JAVA_HOME=/opt/java/openjdk",
+            "ANDROID_HOME=/opt/android-sdk",
+        ):
+            self.assertIn(needle, dockerfile)
 
 
 class ModeSelectionTests(unittest.TestCase):
@@ -1033,8 +1333,9 @@ class ModeSelectionTests(unittest.TestCase):
     def test_create_accepts_the_historical_flag_set(self):
         cfg = cs.parse_args(
             ["-n", "d", "-p", "/x", "-e", "f.env", "-s", "false", "-sf", "s.json",
-             "-gsf", "g.json", "-v", "/a", "-profile", "python",
-             "-profile-directory", "/p", "--no-config", "--dry-run"]
+             "-gsf", "g.json", "-v", "/a", "-protected-paths", "false",
+             "-profile-policy", "python", "-profile-directory", "flutter-sdk",
+             "-profiles-dir", "/p", "--no-config", "--dry-run"]
         )
         self.assertEqual(cs.select_mode(cfg), "create")
         cs.validate_mode_flags(cfg, "create")  # must not raise
@@ -1044,12 +1345,13 @@ class ModeSelectionTests(unittest.TestCase):
             "path": ("-p", "/x", "-p"),
             "envfile": ("-e", "f.env", "-e"),
             "secrets": ("-s", "false", "-s"),
+            "protected_paths": ("-protected-paths", "false", "-protected-paths"),
             "secretsfile": ("-sf", "s.json", "-sf"),
             "volumes": ("-v", "/a", "-v"),
         }
         for label, (option, value, shown) in cases.items():
             with self.subTest(option=option):
-                cfg = cs.parse_args(["-n", "d", "-profile", "python", option, value])
+                cfg = cs.parse_args(["-n", "d", "-profile-policy", "python", option, value])
                 with self.assertRaises(cs.CliError) as caught:
                     cs.validate_mode_flags(cfg, "update")
                 self.assertIn(
@@ -1061,7 +1363,10 @@ class ModeSelectionTests(unittest.TestCase):
         cases = {
             "path": ("-p", "/x", "-p"),
             "volumes": ("-v", "/a", "-v"),
-            "profiles": ("-profile", "python", "-profile"),
+            "profiles": ("-profile-policy", "python", "-profile-policy"),
+            "profile_directories": ("-profile-directory", "flutter-sdk", "-profile-directory"),
+            "profiles_dir": ("-profiles-dir", "/p", "-profiles-dir"),
+            "protected_paths": ("-protected-paths", "false", "-protected-paths"),
         }
         for label, (option, value, shown) in cases.items():
             with self.subTest(option=option):
@@ -1078,7 +1383,10 @@ class ModeSelectionTests(unittest.TestCase):
         cases = {
             "name": ("-n", "d", "-n"),
             "path": ("-p", "/x", "-p"),
-            "profiles": ("-profile", "python", "-profile"),
+            "profiles": ("-profile-policy", "python", "-profile-policy"),
+            "profile_directories": ("-profile-directory", "flutter-sdk", "-profile-directory"),
+            "profiles_dir": ("-profiles-dir", "/p", "-profiles-dir"),
+            "protected_paths": ("-protected-paths", "false", "-protected-paths"),
         }
         for label, (option, value, shown) in cases.items():
             with self.subTest(option=option):
@@ -1105,8 +1413,8 @@ class ModeSelectionTests(unittest.TestCase):
 
     def test_update_help_documents_only_the_update_flags(self):
         text = cs.usage_text("update")
-        for needle in ("-profile", "-profile-directory", "--config-dir",
-                       "--no-config", "--dry-run"):
+        for needle in ("-profile-policy", "-profile-directory", "-profiles-dir",
+                       "--config-dir", "--no-config", "--dry-run"):
             self.assertIn(needle, text)
         for absent in ("-p [project path]", "--recreate", "--from-config", "--force"):
             self.assertNotIn(absent, text)
@@ -1490,9 +1798,11 @@ class ConfigRoundTripTests(unittest.TestCase):
             "project": self.PROJECT,
             "env_file": "/home/o'brien/env file.env",
             "scan_secrets": "false",
+            "protected_paths": "false",
             "secrets_settings": "/home/o'brien/scan it.json",
             "profiles": ["python", "node"],
-            "profile_directory": "/home/o'brien/profiles dir",
+            "profile_directories": ["flutter-sdk", "bundled"],
+            "profiles_dir": "/home/o'brien/profiles dir",
             "volumes": [self.VOLUME],
         }
         values.update(overrides)
@@ -1514,9 +1824,11 @@ class ConfigRoundTripTests(unittest.TestCase):
         self.assertEqual(loaded["project"], self.PROJECT)
         self.assertEqual(loaded["env_file"], values["env_file"])
         self.assertEqual(loaded["scan_secrets"], "false")
+        self.assertEqual(loaded["protected_paths"], "false")
         self.assertEqual(loaded["secrets_settings"], values["secrets_settings"])
         self.assertEqual(loaded["profiles"], ["python", "node"])
-        self.assertEqual(loaded["profile_directory"], values["profile_directory"])
+        self.assertEqual(loaded["profile_directories"], ["flutter-sdk", "bundled"])
+        self.assertEqual(loaded["profiles_dir"], values["profiles_dir"])
         self.assertEqual(loaded["volumes"], [self.VOLUME])
 
     def test_minimal_parser_unescapes_single_quotes(self):
@@ -1530,10 +1842,11 @@ class ConfigRoundTripTests(unittest.TestCase):
     def test_optional_keys_are_omitted_when_empty(self):
         text = cs.render_config({"name": "demo", "project": "/p",
                                  "scan_secrets": "true"})
-        for key in ("env_file:", "secrets_settings:", "profile_directory:",
-                    "profiles:", "volumes:"):
+        for key in ("env_file:", "secrets_settings:", "profile_directories:",
+                    "profiles_dir:", "profiles:", "volumes:"):
             self.assertNotIn(key, text)
         self.assertIn("scan_secrets: true", text)
+        self.assertIn("protected_paths: true", text)
 
     def test_scan_secrets_accepts_bools_and_strings(self):
         for value, expected in (
@@ -1551,6 +1864,14 @@ class ConfigRoundTripTests(unittest.TestCase):
         with self.assertRaises(cs.ConfigError) as caught:
             cs.validate_config(self._base(scan_secrets="yes"), "config x")
         self.assertIn("'scan_secrets' must be true or false", str(caught.exception))
+
+    def test_protected_paths_defaults_to_true_and_is_validated(self):
+        self.assertEqual(
+            cs.validate_config(self._base(), "config x")["protected_paths"], "true"
+        )
+        with self.assertRaises(cs.ConfigError) as caught:
+            cs.validate_config(self._base(protected_paths="yes"), "config x")
+        self.assertIn("'protected_paths' must be true or false", str(caught.exception))
 
     def test_version_must_be_the_supported_one(self):
         for data in (
@@ -1580,17 +1901,32 @@ class ConfigRoundTripTests(unittest.TestCase):
                     cs.validate_config(data, "config x")
 
     def test_relative_optional_paths_are_refused(self):
-        for key in ("env_file", "secrets_settings", "profile_directory"):
+        for key in ("env_file", "secrets_settings", "profiles_dir", "profile_directory"):
             with self.subTest(key=key):
                 with self.assertRaises(cs.ConfigError) as caught:
                     cs.validate_config(self._base(**{key: "relative"}), "config x")
                 self.assertIn(key, str(caught.exception))
                 self.assertIn("must be an absolute path", str(caught.exception))
 
+    def test_the_legacy_profile_directory_key_is_still_accepted(self):
+        loaded = cs.validate_config(
+            self._base(profile_directory="/old/profiles"), "config x"
+        )
+        self.assertEqual(loaded["profiles_dir"], "/old/profiles")
+        self.assertEqual(loaded["profile_directories"], [])
+
+    def test_new_and_legacy_profile_directory_keys_are_ambiguous(self):
+        with self.assertRaises(cs.ConfigError) as caught:
+            cs.validate_config(
+                self._base(profiles_dir="/new", profile_directory="/old"), "config x"
+            )
+        self.assertIn("both 'profiles_dir' and the legacy 'profile_directory'", str(caught.exception))
+
     def test_lists_must_hold_non_empty_strings(self):
         cases = {
             "volumes not a list": {"volumes": "x"},
             "profiles not a list": {"profiles": {"a": 1}},
+            "profile_directories not a list": {"profile_directories": "x"},
             "blank entry": {"volumes": [""]},
             "non-string entry": {"profiles": [1]},
         }
@@ -1598,6 +1934,29 @@ class ConfigRoundTripTests(unittest.TestCase):
             with self.subTest(case=label):
                 with self.assertRaises(cs.ConfigError):
                     cs.validate_config(self._base(**overrides), "config x")
+
+    def test_load_config_migrates_a_directory_name_out_of_profiles(self):
+        profiles = self.root / "profiles"
+        (profiles / "flutter-sdk").mkdir(parents=True)
+        (profiles / "flutter-sdk" / "profile.yaml").write_text(
+            "name: flutter-sdk\npolicies:\n  network:\n    allow:\n      - pypi.org\n"
+        )
+        target = self.root / "old.yaml"
+        target.write_text(
+            cs.render_config({
+                "name": "demo",
+                "project": "/p",
+                "scan_secrets": "true",
+                "profiles": ["flutter-sdk"],
+                "profiles_dir": str(profiles),
+            })
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            loaded = cs.load_config(str(target))
+        self.assertEqual(loaded["profiles"], [])
+        self.assertEqual(loaded["profile_directories"], ["flutter-sdk"])
+        self.assertIn("moved directory profile", err.getvalue())
 
     def test_load_config_reports_a_missing_file(self):
         with self.assertRaises(cs.ConfigError) as caught:
@@ -1767,6 +2126,27 @@ class AddProfilesToConfigTextTests(unittest.TestCase):
             "profiles:\n  - 'python'\n  - 'node'\n",
         )
 
+    def test_directory_names_get_their_own_block(self):
+        text = "version: 1\nprofiles:\n  - 'python'\nvolumes:\n  - '/v'\n"
+        self.assertEqual(
+            cs.add_profiles_to_config_text(text, ["node"], ["flutter-sdk"]),
+            "version: 1\nprofiles:\n  - 'python'\n  - 'node'\n"
+            "profile_directories:\n  - 'flutter-sdk'\n"
+            "volumes:\n  - '/v'\n",
+        )
+
+    def test_profiles_dir_replaces_the_legacy_key(self):
+        text = (
+            "version: 1\n"
+            "profile_directory: '/old'\n"
+            "profiles:\n"
+            "  - 'python'\n"
+        )
+        self.assertEqual(
+            cs.add_profiles_to_config_text(text, [], [], "/new"),
+            "version: 1\nprofiles:\n  - 'python'\nprofiles_dir: '/new'\n",
+        )
+
 
 class UpdateSavedConfigTests(unittest.TestCase):
     def setUp(self):
@@ -1842,16 +2222,23 @@ class UpdateSavedConfigTests(unittest.TestCase):
             cs.update_saved_config(["node"])
         self.assertIn("no saved config for sandbox 'demo'", err.getvalue())
 
-    def test_a_changed_profile_directory_is_recorded(self):
+    def test_a_changed_profiles_dir_is_recorded(self):
         # A profile applied from a non-default directory must be replayable by
         # --recreate, so the directory is recorded with the name.
         self._write_existing()
         profile_dir = self.root / "my-profiles"
-        self._configure("-profile-directory", str(profile_dir))
+        self._configure("-profiles-dir", str(profile_dir))
         cs.update_saved_config(["node"])
         data = cs.load_config(str(self.target))
-        self.assertEqual(data["profile_directory"], str(profile_dir))
+        self.assertEqual(data["profiles_dir"], str(profile_dir))
         self.assertEqual(data["profiles"], ["python", "node"])
+
+    def test_directory_names_are_recorded_in_their_own_list(self):
+        self._write_existing()
+        cs.update_saved_config([], ["flutter-sdk"])
+        data = cs.load_config(str(self.target))
+        self.assertEqual(data["profiles"], ["python"])
+        self.assertEqual(data["profile_directories"], ["flutter-sdk"])
 
     def test_duplicate_names_are_recorded_once(self):
         self._write_existing()
@@ -1872,9 +2259,11 @@ class ApplyLoadedConfigTests(unittest.TestCase):
         "project": "/projects/demo",
         "env_file": "/secrets/sbx.env",
         "scan_secrets": "false",
+        "protected_paths": "false",
         "secrets_settings": "/secrets/scan.json",
         "profiles": ["python", "node"],
-        "profile_directory": "/profiles",
+        "profile_directories": ["flutter-sdk"],
+        "profiles_dir": "/profiles",
         "volumes": ["/data:rw", "/docs"],
     }
 
@@ -1885,9 +2274,11 @@ class ApplyLoadedConfigTests(unittest.TestCase):
         self.assertEqual(cs.CONFIG.path, "/projects/demo")
         self.assertEqual(cs.CONFIG.envfile, "/secrets/sbx.env")
         self.assertEqual(cs.CONFIG.secrets, "false")
+        self.assertEqual(cs.CONFIG.protected_paths, "false")
         self.assertEqual(cs.CONFIG.secretsfile, "/secrets/scan.json")
         self.assertEqual(cs.CONFIG.profiles, "python,node")
-        self.assertEqual(cs.CONFIG.profile_directory, "/profiles")
+        self.assertEqual(cs.CONFIG.profile_directories, ["flutter-sdk"])
+        self.assertEqual(cs.CONFIG.profiles_dir, "/profiles")
         self.assertEqual(cs.CONFIG.volumes, ["/data:rw", "/docs"])
 
     def test_a_name_mismatch_aborts_before_anything_is_copied(self):
@@ -1929,7 +2320,8 @@ class MainModeTests(unittest.TestCase):
         cs.DRY_RUN = self._dry
 
     def _saved_config(
-        self, name="s", scan_secrets="false", volumes=(), profiles=(), profile_directory=""
+        self, name="s", scan_secrets="false", volumes=(), profiles=(),
+        profile_directories=(), profiles_dir=""
     ):
         self.config_dir.mkdir(parents=True, exist_ok=True)
         target = self.config_dir / f"{name}.yaml"
@@ -1940,7 +2332,8 @@ class MainModeTests(unittest.TestCase):
                 "scan_secrets": scan_secrets,
                 "volumes": list(volumes),
                 "profiles": list(profiles),
-                "profile_directory": profile_directory,
+                "profile_directories": list(profile_directories),
+                "profiles_dir": profiles_dir,
             })
         )
         return target
@@ -1994,6 +2387,18 @@ class MainModeTests(unittest.TestCase):
         self.assertEqual(calls[0], ["rm", "s"])
         self.assertEqual(calls[1][0:2], ["create", "--name"])
 
+    def test_invalid_protected_paths_value_aborts(self):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            err
+        ), self.assertRaises(SystemExit) as ctx:
+            cs.main(
+                ["--dry-run", "-n", "s", "-p", str(self.project), "-s", "false",
+                 "-protected-paths=maybe", "--config-dir", str(self.config_dir)]
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("-protected-paths must be true or false", err.getvalue())
+
     def test_from_config_dry_run_echoes_the_create_command(self):
         volume = self.root / "data"
         volume.mkdir()
@@ -2026,8 +2431,8 @@ class MainModeTests(unittest.TestCase):
             err
         ), self.assertRaises(SystemExit) as ctx:
             cs.main(["-n", "s", "-p", str(self.project), "-s", "false",
-                     "--dry-run", "-profile", "bad",
-                     "-profile-directory", str(profile_dir),
+                     "--dry-run", "-profile-directory", "bad",
+                     "-profiles-dir", str(profile_dir),
                      "--config-dir", str(self.config_dir)])
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("settings.json", err.getvalue())

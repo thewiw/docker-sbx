@@ -22,7 +22,8 @@ Usage:
     python3 docker-sbx-create-sandbox.py --dry-run -n test -p /tmp/project
 
 Applying profiles to an existing sandbox is a separate command:
-    python3 docker-sbx-apply-profile.py -n NAME -profile NAMES
+    python3 docker-sbx-apply-profile.py -n NAME -profile-policy NAMES
+    python3 docker-sbx-apply-profile.py -n NAME -profile-directory NAMES
 """
 
 from __future__ import annotations
@@ -88,7 +89,9 @@ FORBIDDEN_PROFILE_KEYS = ("global", "default", "all_sandboxes", "sandbox_default
 
 # The documented top-level keys. Anything else is refused rather than ignored: a
 # typo'd `policy:` used to be silently dropped, creating a sandbox with no rules.
-PROFILE_KEYS = ("name", "description", "policies")
+# `kit` is only valid in a directory profile: it names a kit directory inside the
+# bundle, which `sbx create --kit` builds before the sandbox exists.
+PROFILE_KEYS = ("name", "description", "policies", "kit")
 
 # A policy entry names a host, optionally wildcarded ("*.example.com"). Syntax
 # only: `sbx policy` remains the authority, but a URL or a path is never a domain.
@@ -117,8 +120,12 @@ CONFIG_KEYS = (
     "project",
     "env_file",
     "scan_secrets",
+    "protected_paths",
     "secrets_settings",
     "profiles",
+    "profile_directories",
+    "profiles_dir",
+    # Legacy name for profiles_dir; accepted on load and rewritten on update.
     "profile_directory",
     "volumes",
 )
@@ -184,10 +191,17 @@ def run(cmd, *, check: bool = True, capture: bool = False, quiet: bool = False):
     probe), where one line per attempt would bury the rest of the output.
     """
     cmd = [str(c) for c in cmd]
-    if not quiet:
+    # `sbx` calls are plumbing: the command echo buried the useful lines, and
+    # `sbx create` already prints its own KITS/SANDBOX/IMAGE progress. Keep the
+    # echo in --dry-run, where printing the command *is* the output.
+    if not quiet and (DRY_RUN or cmd[0] != "sbx"):
         info("  $ " + " ".join(shlex.quote(c) for c in cmd))
     if DRY_RUN:
         return _DryResult()
+    # The child inherits stdout; flush ours first so the banner, the selected
+    # profiles and the command's progress appear in the order they happen when
+    # the output is a pipe rather than a terminal.
+    _flush_stdout()
     try:
         proc = subprocess.run(cmd, text=True, capture_output=capture)
     except FileNotFoundError:
@@ -231,11 +245,16 @@ class Config:
         self.path = ""
         self.envfile = ""
         self.secrets = "true"
+        self.protected_paths = "true"
         self.secretsfile = ""
         self.gensecretsfile = ""
         self.volumes = []
+        # -profile-policy names (flat network-only profiles) and
+        # -profile-directory names (directory bundles such as flutter-sdk).
         self.profiles = ""
-        self.profile_directory = ""
+        self.profile_directories = []
+        # -profiles-dir: the base directory both selectors resolve against.
+        self.profiles_dir = ""
         self.from_config = ""
         self.config_dir = ""
         self.recreate = False
@@ -249,27 +268,101 @@ class Config:
         self.seen = set()
 
 
+def _profile_description(definition: Path) -> str:
+    """Best-effort one-line description for the help listing."""
+    try:
+        text = definition.read_text()
+        try:
+            import yaml  # noqa: F401  (optional: full YAML when installed)
+        except ImportError:
+            data = parse_profile_minimal(text, str(definition))
+        else:
+            data = yaml.safe_load(text)
+        if isinstance(data, dict):
+            description = data.get("description")
+            if isinstance(description, str) and description.strip():
+                return " ".join(description.split())
+    except Exception:
+        pass
+    return "(no description)"
+
+
+def _profiles_base_for_help() -> Path:
+    return Path(CONFIG.profiles_dir) if CONFIG.profiles_dir else script_dir() / "profiles"
+
+
+def _format_profile_entries(entries) -> list:
+    if not entries:
+        return ["    (none)"]
+    width = max(len(name) for name, _description in entries)
+    return [
+        f"    {name.ljust(width)}  {description}"
+        for name, description in entries
+    ]
+
+
+def available_profile_lines() -> list:
+    """The profile listing shown by --help, from the active profiles directory."""
+    base = _profiles_base_for_help()
+    policies, directories = [], []
+    if base.is_dir():
+        for entry in sorted(base.iterdir(), key=lambda item: item.name.lower()):
+            if entry.is_file() and entry.suffix.lower() in (".yaml", ".yml"):
+                policies.append((entry.stem, _profile_description(entry)))
+            elif entry.is_dir():
+                for candidate in PROFILE_DEFINITION_NAMES:
+                    definition = entry / candidate
+                    if definition.is_file():
+                        directories.append(
+                            (entry.name, _profile_description(definition))
+                        )
+                        break
+    else:
+        return [
+            f"Available profiles in {base}:",
+            "  (profiles directory not found)",
+            "",
+        ]
+    policies.sort(key=lambda item: item[0].lower())
+    directories.sort(key=lambda item: item[0].lower())
+    return [
+        f"Available profiles in {base}:",
+        "  Policy profiles (-profile-policy):",
+        *_format_profile_entries(policies),
+        "  Directory profiles (-profile-directory):",
+        *_format_profile_entries(directories),
+        "",
+    ]
+
+
 def usage_text(mode: str = "create") -> str:
     scriptname = Path(sys.argv[0]).name
     if mode == "update":
         return "\n".join(
             [
-                f"Usage: {scriptname} -n [sandbox name] -profile [profile names] [options]",
-                "Apply policy profiles (network rules and Claude assets) to an existing sandbox,",
+                f"Usage: {scriptname} -n [sandbox name] (-profile-policy names | -profile-directory names) [options]",
+                "Apply flat policy profiles and/or directory bundles to an existing sandbox,",
                 "then record them in the sandbox's saved config.",
                 "Options:",
                 "  -n string               Sandbox to update [mandatory]",
-                "  -profile names          Comma-separated profiles to apply, in order [mandatory]",
-                "  -profile-directory path Directory containing profile YAML files [optional, default: ./profiles]",
+                "  -profile-policy names   Flat policy profiles to apply, in order; comma-separate",
+                "                          or repeat [optional]",
+                "  -profile-directory names Directory profile bundles to apply, in order;",
+                "                          comma-separate or repeat [optional]",
+                "                          A bundle that carries a kit is refused (create-time only).",
+                "  -profiles-dir path      Base directory both selectors resolve against",
+                "                          [optional, default: ./profiles]",
                 "",
                 "  --config-dir dir  Directory holding <sandbox>.yaml config files [optional]",
                 "  --no-config       Do not update the sandbox's saved config",
                 "  --dry-run         Print every command that would run, and change nothing",
                 "  -h, --help        Show this help and exit",
                 "",
+                *available_profile_lines(),
                 "Example(s):",
-                f"  {scriptname} -n test -profile node",
-                f"  {scriptname} -n test -profile python,node -profile-directory ~/my-profiles",
+                f"  {scriptname} -n test -profile-policy python,node",
+                f"  {scriptname} -n test -profile-directory node --profile-policy python",
+                f"  {scriptname} -n test -profile-directory flutter-sdk --profiles-dir ~/my-profiles",
                 "",
             ]
         )
@@ -277,17 +370,25 @@ def usage_text(mode: str = "create") -> str:
         [
             f"Usage: {scriptname} -n [sandbox name] -p [project path] -e [sandbox env file] -s [check secrets] -sf [secrets config file]",
             "Options:",
-            "  -n string     Define the name of the new sandbox [mandatory]",
-            "  -p string     Absolute path of project's directory [mandatory]",
-            "  -e string     Env file [optional]",
-            "  -s true/false Check for secrets (default true)",
+            "  -n, -name string             Define the name of the new sandbox [mandatory]",
+            "  -p, -project string          Absolute path of project's directory [mandatory]",
+            "  -e, -env string              Env file [optional]",
+            "  -s, -scan-secrets true/false Check for secrets (default true)",
+            "  -protected-paths true/false  Install the Claude Code protected-path guard",
+            "                (default true). It blocks Read/Write/Edit/Bash access to",
+            "                GoogleService-Info.plist, google-services.json and launch.json.",
             "  -sf string    Secrets config JSON file [optional]",
             "  -gsf string   Generate a default secrets config JSON file and exit",
-            "  -v path       Mount an extra host directory/file into the sandbox (absolute path).",
-            "                Repeat -v for multiple mounts. Read-only by default; append :rw to",
+            "  -v, -volume path  Mount an extra host directory/file into the sandbox (absolute path).",
+            "                Repeat for multiple mounts. Read-only by default; append :rw to",
             "                mount read-write (or :ro to be explicit). e.g. -v /mnt/c/docs -v /mnt/c/data:rw",
-            "  -profile names Comma-separated list of policy profiles to apply (order matters) [optional]",
-            "  -profile-directory path Directory containing profile YAML files [optional, default: ./profiles]",
+            "  -profile-policy names Flat policy profiles to apply, in order; comma-separate",
+            "                or repeat ([optional], e.g. -profile-policy python,java).",
+            "  -profile-directory names Directory profile bundles to apply, in order;",
+            "                comma-separate or repeat ([optional], e.g. -profile-directory",
+            "                flutter-sdk). A bundle may install a sandbox kit at creation.",
+            "  -profiles-dir path Base directory both selectors resolve against",
+            "                [optional, default: ./profiles].",
             "",
             "  --recreate        Rebuild sandbox -n from its saved config (refuses if it exists)",
             "  --force           With --recreate: remove the existing sandbox first (sbx rm)",
@@ -301,13 +402,15 @@ def usage_text(mode: str = "create") -> str:
             "",
             "To add profiles to a sandbox that already exists, use docker-sbx-apply-profile.py.",
             "",
+            *available_profile_lines(),
             "Example(s):",
             f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test",
             f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test -e sbx.env",
             f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test -e sbx.env -sf secrets.json",
             f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test -v /mnt/c/docs -v /mnt/c/data:rw",
-            f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test -profile python",
-            f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test -profile python,java",
+            f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test -profile-policy python",
+            f"  from WSL : {scriptname} -n test -p /mnt/c/Projects/test -profile-policy python,java",
+            f"  flutter  : {scriptname} -n mobile -p /mnt/c/Projects/app -profile-directory flutter-sdk",
             f"  from WSL : {scriptname} -gsf secrets.json",
             f"  recreate : {scriptname} -n test --recreate --force",
             f"  from file: {scriptname} --from-config ~/.config/docker-sbx/sandboxes/test.yaml",
@@ -324,14 +427,21 @@ def usage(exit_code: int = 1, mode: str = "create") -> "None":
 # Options that consume the following argument.
 _VALUE_OPTIONS = {
     "-n": "name",
+    "-name": "name",
     "-p": "path",
+    "-project": "path",
     "-e": "envfile",
+    "-env": "envfile",
     "-s": "secrets",
+    "-scan-secrets": "secrets",
+    "-protected-paths": "protected_paths",
     "-sf": "secretsfile",
     "-gsf": "gensecretsfile",
     "-v": "volumes",
-    "-profile": "profiles",
-    "-profile-directory": "profile_directory",
+    "-volume": "volumes",
+    "-profile-policy": "profiles",
+    "-profile-directory": "profile_directories",
+    "-profiles-dir": "profiles_dir",
     "--from-config": "from_config",
     "--config-dir": "config_dir",
 }
@@ -359,6 +469,16 @@ def parse_args(argv):
         if arg in ("-h", "--help"):
             cfg.show_help = True
             return cfg
+        # Accept `-option=value` as well as `-option value` for value options,
+        # so boolean-looking settings such as -protected-paths=false work as
+        # written. Only known value options take this path; anything else stays
+        # an unknown option.
+        inline_value = None
+        if "=" in arg:
+            name, _, candidate = arg.partition("=")
+            if name in _VALUE_OPTIONS:
+                arg = name
+                inline_value = candidate
         boolean = _BOOLEAN_OPTIONS.get(arg)
         if boolean is not None:
             setattr(cfg, boolean, True)
@@ -367,12 +487,22 @@ def parse_args(argv):
         attribute = _VALUE_OPTIONS.get(arg)
         if attribute is None:
             raise CliError(f"Unknown option: {arg}")
-        if index >= len(argv):
-            raise CliError(f"Option {arg} requires a value")
-        value = argv[index]
-        index += 1
+        if inline_value is not None:
+            value = inline_value
+        else:
+            if index >= len(argv):
+                raise CliError(f"Option {arg} requires a value")
+            value = argv[index]
+            index += 1
         if attribute == "volumes":
             cfg.volumes.append(value)
+        elif attribute == "profiles":
+            # Accept both `-profile-policy a,b` and repeated occurrences.
+            # Keeping the attribute a comma-separated string preserves the
+            # existing split_profile_names() callers and the saved config form.
+            cfg.profiles = ",".join(part for part in (cfg.profiles, value) if part)
+        elif attribute == "profile_directories":
+            cfg.profile_directories.append(value)
         else:
             setattr(cfg, attribute, value)
         cfg.seen.add(attribute)
@@ -401,6 +531,7 @@ _CREATE_FLAGS = {
     "path": "-p",
     "envfile": "-e",
     "secrets": "-s",
+    "protected_paths": "-protected-paths",
     "secretsfile": "-sf",
     "gensecretsfile": "-gsf",
     "volumes": "-v",
@@ -421,7 +552,10 @@ def validate_mode_flags(cfg: Config, mode: str) -> None:
         "from-config": "--from-config",
     }[mode]
     allowed = {
-        "update": {"name", "profiles", "profile_directory", "config_dir", "dry_run", "no_config"},
+        "update": {
+            "name", "profiles", "profile_directories", "profiles_dir",
+            "config_dir", "dry_run", "no_config",
+        },
         "recreate": {"name", "config_dir", "dry_run", "no_config", "recreate", "force"},
         "from-config": {"from_config", "config_dir", "dry_run", "no_config"},
     }[mode]
@@ -495,26 +629,38 @@ def render_config(values: dict) -> str:
         lines.append(f"env_file: {_yaml_string(values['env_file'])}")
     scan = "false" if str(values.get("scan_secrets", "true")).lower() == "false" else "true"
     lines.append(f"scan_secrets: {scan}")
+    protected = (
+        "false"
+        if str(values.get("protected_paths", "true")).lower() == "false"
+        else "true"
+    )
+    lines.append(f"protected_paths: {protected}")
     if values.get("secrets_settings"):
         lines.append(f"secrets_settings: {_yaml_string(values['secrets_settings'])}")
     if values.get("profiles"):
         lines.append("profiles:")
         lines.extend(f"  - {_yaml_string(profile)}" for profile in values["profiles"])
-    if values.get("profile_directory"):
-        lines.append(f"profile_directory: {_yaml_string(values['profile_directory'])}")
+    if values.get("profile_directories"):
+        lines.append("profile_directories:")
+        lines.extend(
+            f"  - {_yaml_string(directory)}"
+            for directory in values["profile_directories"]
+        )
+    if values.get("profiles_dir"):
+        lines.append(f"profiles_dir: {_yaml_string(values['profiles_dir'])}")
     if values.get("volumes"):
         lines.append("volumes:")
         lines.extend(f"  - {_yaml_string(volume)}" for volume in values["volumes"])
     return "\n".join(lines) + "\n"
 
 
-def _config_bool(value, where: str) -> str:
+def _config_bool(value, where: str, key: str = "scan_secrets") -> str:
     """Normalise PyYAML's bool and the minimal parser's string to "true"/"false"."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str) and value.strip().lower() in ("true", "false"):
         return value.strip().lower()
-    raise ConfigError(f"{where} 'scan_secrets' must be true or false")
+    raise ConfigError(f"{where} '{key}' must be true or false")
 
 
 def _config_string(value, key: str, where: str, *, required: bool = False) -> str:
@@ -567,20 +713,38 @@ def validate_config(data, where: str) -> dict:
         raise ConfigError(f"{where} 'project' must be an absolute path")
 
     paths = {}
-    for key in ("env_file", "secrets_settings", "profile_directory"):
+    for key in ("env_file", "secrets_settings"):
         value = _config_string(data.get(key), key, where)
         if value and not os.path.isabs(value):
             raise ConfigError(f"{where} '{key}' must be an absolute path")
         paths[key] = value
+
+    profiles_dir = _config_string(data.get("profiles_dir"), "profiles_dir", where)
+    legacy_dir = _config_string(data.get("profile_directory"), "profile_directory", where)
+    if profiles_dir and legacy_dir:
+        raise ConfigError(
+            f"{where} has both 'profiles_dir' and the legacy 'profile_directory'"
+        )
+    if profiles_dir and not os.path.isabs(profiles_dir):
+        raise ConfigError(f"{where} 'profiles_dir' must be an absolute path")
+    if legacy_dir and not os.path.isabs(legacy_dir):
+        raise ConfigError(f"{where} 'profile_directory' must be an absolute path")
+    profiles_dir = profiles_dir or legacy_dir
 
     return {
         "name": name.strip(),
         "project": project,
         "env_file": paths["env_file"],
         "scan_secrets": _config_bool(data.get("scan_secrets", "true"), where),
+        "protected_paths": _config_bool(
+            data.get("protected_paths", "true"), where, "protected_paths"
+        ),
         "secrets_settings": paths["secrets_settings"],
         "profiles": _config_string_list(data.get("profiles"), "profiles", where),
-        "profile_directory": paths["profile_directory"],
+        "profile_directories": _config_string_list(
+            data.get("profile_directories"), "profile_directories", where
+        ),
+        "profiles_dir": profiles_dir,
         "volumes": _config_string_list(data.get("volumes"), "volumes", where),
     }
 
@@ -605,7 +769,46 @@ def load_config(config_path: str) -> dict:
             data = yaml.safe_load(text)
         except Exception as exc:
             raise ConfigError(f"failed to parse {where}: {exc}")
-    return validate_config(data, where)
+    data = validate_config(data, where)
+    _migrate_config_profile_kinds(data, where)
+    return data
+
+
+def _migrate_config_profile_kinds(data: dict, where: str) -> None:
+    """Move names recorded under the wrong selector in an older config.
+
+    Before the -profile-policy / -profile-directory split, both kinds lived in
+    `profiles:`. A config written then would otherwise fail to recreate once the
+    directory name is resolved as a flat policy. CLI flags stay strict; this is
+    only a load-time migration of the saved config, and it rewrites nothing on
+    disk until the config is saved again.
+    """
+    base = Path(data["profiles_dir"]) if data["profiles_dir"] else script_dir() / "profiles"
+    if not base.is_dir():
+        return
+    for key, other, want_directory in (
+        ("profiles", "profile_directories", False),
+        ("profile_directories", "profiles", True),
+    ):
+        kept = []
+        for profile_name in data[key]:
+            try:
+                source = resolve_profile(base, profile_name)
+            except ProfileError:
+                kept.append(profile_name)
+                continue
+            is_directory = source.assets_root is not None
+            if is_directory == want_directory:
+                kept.append(profile_name)
+                continue
+            if profile_name not in data[other]:
+                data[other].append(profile_name)
+            warn(
+                f"{where}: moved {'directory' if is_directory else 'flat'} profile "
+                f"'{profile_name}' to {other} (separate profile-policy and "
+                "profile-directory selectors)"
+            )
+        data[key] = kept
 
 
 def write_config_file(target: Path, text: str) -> None:
@@ -637,15 +840,17 @@ def current_config_values() -> dict:
         "project": os.path.abspath(path()),
         "env_file": os.path.abspath(envfile()) if envfile() else "",
         "scan_secrets": "false" if secrets().lower() == "false" else "true",
+        "protected_paths": (
+            "false" if protected_paths().lower() == "false" else "true"
+        ),
         "secrets_settings": os.path.abspath(secretsfile()) if secretsfile() else "",
         "profiles": split_profile_names(profiles()),
+        "profile_directories": split_profile_names(",".join(profile_directories())),
         # Omitted when the default ./profiles is in use (the option is simply
         # empty), so the file stays portable across checkouts; an explicit
-        # -profile-directory - or one loaded from another config - is recorded
+        # -profiles-dir - or one loaded from another config - is recorded
         # absolutely.
-        "profile_directory": (
-            os.path.abspath(profile_directory()) if profile_directory() else ""
-        ),
+        "profiles_dir": os.path.abspath(profiles_dir()) if profiles_dir() else "",
         "volumes": list(volumes()),
     }
 
@@ -676,14 +881,23 @@ def save_created_config() -> str:
     return str(target)
 
 
-def _set_config_scalar_text(text: str, key: str, value: str):
-    """Set a top-level scalar key in place, inserting it before volumes: if new."""
+def _set_config_scalar_text(text: str, key: str, value: str, legacy_keys=()):
+    """Set a top-level scalar key in place, inserting it before volumes: if new.
+
+    Any legacy key naming the same value is removed, so a file written by an
+    older version migrates instead of carrying both keys (which the loader
+    rejects as ambiguous).
+    """
     replacement = f"{key}: {_yaml_string(value)}"
-    lines = text.splitlines()
+    lines = [
+        line
+        for line in text.splitlines()
+        if not any(line.startswith(f"{legacy}:") for legacy in legacy_keys)
+    ]
     for index, line in enumerate(lines):
         if line.startswith(f"{key}:"):
             if line.rstrip() == replacement:
-                return text
+                return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
             lines[index] = replacement
             return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
     for index, line in enumerate(lines):
@@ -695,89 +909,112 @@ def _set_config_scalar_text(text: str, key: str, value: str):
     return "\n".join(lines) + "\n"
 
 
-def add_profiles_to_config_text(text: str, profile_names, profile_directory=None):
-    """Append missing names to the profiles: block, preserving every other byte.
+def _merge_config_list_text(text: str, key: str, names):
+    """Append missing names to a top-level block list, preserving other bytes.
 
     An inline flow list (`profiles: [python]`) is rewritten into the block form,
-    which is the subset the dependency-free parser can read. `profile_directory`,
-    when given, is recorded in the same pass. Returns None for any other form this
-    line surgery cannot handle, so the caller can fall back to parse-and-re-render.
+    which is the subset the dependency-free parser can read. Returns None for
+    any other form this line surgery cannot handle, so the caller can fall back
+    to parse-and-re-render.
     """
-    names = []
-    for item in profile_names:
+    wanted = []
+    for item in names:
         item = item.strip() if isinstance(item, str) else ""
-        if item and item not in names:
-            names.append(item)
+        if item and item not in wanted:
+            wanted.append(item)
+    if not wanted:
+        return text
+
     lines = text.splitlines()
     start = None
     trailing = "\n" if text.endswith("\n") else ""
     for index, line in enumerate(lines):
-        if not line.startswith("profiles:"):
+        if not line.startswith(f"{key}:"):
             continue
-        inline = line[len("profiles:") :].strip()
+        inline = line[len(key) + 1 :].strip()
         if inline:
             if not (inline.startswith("[") and inline.endswith("]")):
                 return None
             parts = [part.strip() for part in inline[1:-1].split(",") if part.strip()]
             try:
-                merged = [_scalar(part, "profiles") for part in parts]
+                merged = [_scalar(part, key) for part in parts]
             except ProfileError:
                 return None
-            for item in names:
+            for item in wanted:
                 if item not in merged:
                     merged.append(item)
-            lines[index : index + 1] = ["profiles:"] + [
+            lines[index : index + 1] = [f"{key}:"] + [
                 f"  - {_yaml_string(item)}" for item in merged
             ]
-            result = "\n".join(lines) + trailing
-            return (
-                _set_config_scalar_text(result, "profile_directory", profile_directory)
-                if profile_directory
-                else result
-            )
+            return "\n".join(lines) + trailing
         start = index
         break
 
     if start is None:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines.append("profiles:")
-        lines.extend(f"  - {_yaml_string(item)}" for item in names)
-        result = "\n".join(lines) + "\n"
-    else:
-        existing = []
-        last_item = start
-        index = start + 1
-        while index < len(lines):
-            line = lines[index]
-            if not line.strip():
-                index += 1
-                continue
-            if not line.startswith((" ", "\t")):
+        block = [f"{key}:"] + [f"  - {_yaml_string(item)}" for item in wanted]
+        for index, line in enumerate(lines):
+            if line.startswith("volumes:"):
+                lines[index:index] = block
                 break
-            match = re.match(r"^\s+-\s+(.*)$", line)
-            if match:
-                try:
-                    existing.append(_scalar(match.group(1).strip(), "profiles"))
-                except ProfileError:
-                    pass
-                last_item = index
+        else:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.extend(block)
+        return "\n".join(lines) + "\n"
+
+    existing = []
+    last_item = start
+    index = start + 1
+    while index < len(lines):
+        line = lines[index]
+        if not line.strip():
             index += 1
+            continue
+        if not line.startswith((" ", "\t")):
+            break
+        match = re.match(r"^\s+-\s+(.*)$", line)
+        if match:
+            try:
+                existing.append(_scalar(match.group(1).strip(), key))
+            except ProfileError:
+                pass
+            last_item = index
+        index += 1
 
-        missing = [item for item in names if item not in existing]
-        if missing:
-            lines[last_item + 1 : last_item + 1] = [
-                f"  - {_yaml_string(item)}" for item in missing
-            ]
-        result = "\n".join(lines) + trailing
+    missing = [item for item in wanted if item not in existing]
+    if missing:
+        lines[last_item + 1 : last_item + 1] = [
+            f"  - {_yaml_string(item)}" for item in missing
+        ]
+    return "\n".join(lines) + trailing
 
-    if profile_directory:
-        result = _set_config_scalar_text(result, "profile_directory", profile_directory)
+
+def add_profiles_to_config_text(
+    text: str, profile_names, directory_names=(), profiles_dir=None
+):
+    """Record policy names, directory names and the profiles base directory.
+
+    Preserves every byte it does not have to change; returns None when a
+    hand-edited list form needs parse-and-re-render.
+    """
+    result = text
+    for key, names in (
+        ("profiles", profile_names),
+        ("profile_directories", directory_names),
+    ):
+        merged = _merge_config_list_text(result, key, names)
+        if merged is None:
+            return None
+        result = merged
+    if profiles_dir:
+        result = _set_config_scalar_text(
+            result, "profiles_dir", profiles_dir, ("profile_directory",)
+        )
     return result
 
 
-def update_saved_config(profile_names) -> None:
-    """Record newly applied profiles (and their directory) in the saved config."""
+def update_saved_config(profile_names, directory_names=()) -> None:
+    """Record newly applied policy/directory names and the profiles base dir."""
     if CONFIG.no_config:
         return
     try:
@@ -800,25 +1037,29 @@ def update_saved_config(profile_names) -> None:
         )
         return
 
-    # The directory a profile was applied from must be recorded too, or a later
-    # --recreate resolves the same names against the default ./profiles.
-    effective_directory = os.path.abspath(profile_directory()) if profile_directory() else ""
+    # The base directory a profile was applied from must be recorded too, or a
+    # later --recreate resolves the same names against the default ./profiles.
+    effective_directory = os.path.abspath(profiles_dir()) if profiles_dir() else ""
     try:
         text = target.read_text()
         updated = add_profiles_to_config_text(
-            text, profile_names, effective_directory or None
+            text, profile_names, directory_names, effective_directory or None
         )
         if updated is None:
             # Unusual hand-edited form: preserve the values, re-render canonically.
             data = load_config(str(target))
-            merged = list(data["profiles"])
-            for item in profile_names:
-                item = item.strip()
-                if item and item not in merged:
-                    merged.append(item)
-            data["profiles"] = merged
+            for key, names in (
+                ("profiles", profile_names),
+                ("profile_directories", directory_names),
+            ):
+                merged = list(data[key])
+                for item in names:
+                    item = item.strip()
+                    if item and item not in merged:
+                        merged.append(item)
+                data[key] = merged
             if effective_directory:
-                data["profile_directory"] = effective_directory
+                data["profiles_dir"] = effective_directory
             updated = render_config(data)
         write_config_file(target, updated)
     except (OSError, UnicodeError, ConfigError) as exc:
@@ -837,10 +1078,12 @@ def apply_loaded_config(data: dict, expected_name: str = "") -> None:
     CONFIG.path = data["project"]
     CONFIG.envfile = data["env_file"]
     CONFIG.secrets = data["scan_secrets"]
+    CONFIG.protected_paths = data["protected_paths"]
     CONFIG.secretsfile = data["secrets_settings"]
     CONFIG.volumes = list(data["volumes"])
     CONFIG.profiles = ",".join(data["profiles"])
-    CONFIG.profile_directory = data["profile_directory"]
+    CONFIG.profile_directories = list(data["profile_directories"])
+    CONFIG.profiles_dir = data["profiles_dir"]
 
 
 # --------------------------------------------------------------------------
@@ -1157,8 +1400,19 @@ def wait_for_sandbox() -> bool:
         time.sleep(SANDBOX_READY_POLL)
 
 
+def show_selected_profiles() -> None:
+    """Summarise the selectors just below the creation banner."""
+    policies = split_profile_names(profiles())
+    directories = directory_names()
+    if policies:
+        info(f"Policy profiles: {', '.join(policies)}")
+    if directories:
+        info(f"Directory profiles: {', '.join(directories)}")
+
+
 def create_sandbox(volume_args) -> None:
     banner(f"Creating sandbox {name()}")
+    show_selected_profiles()
     info()
 
     # Never reconfigure a sandbox we did not just create. `sbx create` fails on an
@@ -1186,9 +1440,16 @@ def create_sandbox(volume_args) -> None:
                 "or choose another name with -n"
             )
 
+    # A profile may carry a kit (a build context for `sbx create --kit`). It has
+    # to be selected here, at creation; apply_profiles() cannot add it later.
+    kit_args = profile_kit_args()
+
     # Fatal: every later step (cp, exec, policy) assumes this sandbox exists, and is
     # the one we just made.
-    sbx(["create", "--name", name(), "claude", path(), *volume_args], check=True)
+    sbx(
+        ["create", "--name", name(), "claude", path(), *volume_args, *kit_args],
+        check=True,
+    )
 
 
 def setup_sandbox() -> None:
@@ -1210,9 +1471,23 @@ def setup_sandbox() -> None:
     setup_script = script_dir() / "sandbox" / "docker-sbx-setup-sandbox.sh"
     slack_script = script_dir() / "sandbox" / "docker-sbx-slack-notify.sh"
     nctalk_script = script_dir() / "sandbox" / "docker-sbx-nctalk-notify.sh"
+    protect_script = (
+        script_dir() / "sandbox" / "docker-sbx-guard-protected-paths.sh"
+    )
 
     sbx(["cp", str(setup_script), f"{name()}:{SBX_HOME}/setup-sandbox.sh"])
     sbx(["exec", "-ti", name(), "sudo", "chmod", "755", f"{SBX_HOME}/setup-sandbox.sh"])
+
+    # The protected-path guard is on by default. Stage its hook only when
+    # enabled; the setup script wires it into settings.json.
+    if protected_paths() == "true":
+        sbx(["cp", str(protect_script), f"{name()}:{SBX_HOME}/guard-protected-paths.sh"])
+        sbx(
+            [
+                "exec", "-ti", name(), "sudo", "chmod", "755",
+                f"{SBX_HOME}/guard-protected-paths.sh",
+            ]
+        )
 
     # Each provider's hook script is staged only when that feature is switched on,
     # so a sandbox without it keeps exactly the previous behaviour. They are
@@ -1229,7 +1504,12 @@ def setup_sandbox() -> None:
     # standing in for "no env file": an empty argument does not survive the trip
     # through `sbx exec`.
     if not envfile():
-        sbx(["exec", "-ti", name(), "bash", f"{SBX_HOME}/setup-sandbox.sh", path(), "-"])
+        sbx(
+            [
+                "exec", "-ti", name(), "bash", f"{SBX_HOME}/setup-sandbox.sh",
+                path(), "-", protected_paths(),
+            ]
+        )
         return
 
     info(f"Using env file {envfile()}")
@@ -1239,7 +1519,7 @@ def setup_sandbox() -> None:
     sbx(
         [
             "exec", "-ti", name(), "bash", f"{SBX_HOME}/setup-sandbox.sh",
-            path(), f"{SBX_HOME}/{envbasename}",
+            path(), f"{SBX_HOME}/{envbasename}", protected_paths(),
         ]
     )
 
@@ -1563,8 +1843,47 @@ def parse_profile_minimal(text: str, where: str):
     return value
 
 
-def validate_profile(data, where: str):
-    """Validate the documented profile schema, returning (allowed, denied).
+def _profile_kit(data, where: str, assets_root):
+    """The declared kit directory name ("" when absent), validated.
+
+    A kit is only meaningful for a directory profile: its build context is a
+    directory inside the bundle. Requiring a single path component keeps the kit
+    inside the profile and lets profile_asset_plan() exclude exactly one entry
+    from the Claude asset tree.
+    """
+    if "kit" not in data:
+        return ""
+    value = data.get("kit")
+    if not isinstance(value, str):
+        raise ProfileError(f"profile {where} 'kit' must be a string")
+    kit = value.strip()
+    if not kit:
+        raise ProfileError(f"profile {where} 'kit' must name a directory")
+    if (
+        kit in (".", "..")
+        or any(char in kit for char in ("/", "\\"))
+        or (os.name == "nt" and ":" in kit)
+    ):
+        raise ProfileError(
+            f"profile {where} 'kit' must be a single directory name inside the profile"
+        )
+    if assets_root is None:
+        raise ProfileError(
+            f"profile {where} declares a kit but is a flat profile; "
+            "use a directory profile with a profile.yaml"
+        )
+    kit_dir = Path(assets_root) / kit
+    if not kit_dir.is_dir():
+        raise ProfileError(f"profile {where} kit directory '{kit}' was not found")
+    if not any(kit_dir.glob("*.yaml")) and not any(kit_dir.glob("*.yml")):
+        raise ProfileError(
+            f"profile {where} kit directory '{kit}' has no kit descriptor (*.yaml)"
+        )
+    return kit
+
+
+def validate_profile(data, where: str, assets_root=None):
+    """Validate the documented profile schema, returning (allowed, denied, kit).
 
     Unknown keys are refused at every level rather than ignored. A silent drop is
     the dangerous case: `policy:` (a typo for `policies:`) or `allow_domains:`
@@ -1644,11 +1963,12 @@ def validate_profile(data, where: str):
                     f"'{domain}' (expected a host such as example.com or *.example.com)"
                 )
             (allowed if action == "allow" else denied).append(domain)
-    return allowed, denied
+    kit = _profile_kit(data, where, assets_root)
+    return allowed, denied, kit
 
 
-def load_profile(profile_path: str):
-    """(allowed, denied) for one profile file, using PyYAML when it is available."""
+def load_profile(profile_path: str, assets_root=None):
+    """(allowed, denied, kit) for one profile, using PyYAML when available."""
     where = profile_path
     try:
         text = Path(profile_path).read_text()
@@ -1664,16 +1984,22 @@ def load_profile(profile_path: str):
             data = yaml.safe_load(text)
         except Exception as exc:
             raise ProfileError(f"failed to parse profile {where}: {exc}")
-    return validate_profile(data, where)
+    return validate_profile(data, where, assets_root)
 
 
 class ProfileSource:
-    """A profile definition plus the directory that carries its assets, if any."""
+    """A profile definition plus the directory that carries its assets, if any.
+
+    `kit` is the relative directory name declared by the profile ("" when it has
+    none); `kit_path` is its resolved absolute path, ready for `sbx create --kit`.
+    """
 
     def __init__(self, name: str, definition: Path, assets_root=None) -> None:
         self.name = name
         self.definition = definition
         self.assets_root = assets_root
+        self.kit = ""
+        self.kit_path = None
 
 
 def resolve_profile(profiles_dir: Path, profile_name: str) -> ProfileSource:
@@ -1767,15 +2093,19 @@ def _check_asset_paths(level: str, files) -> None:
             )
 
 
-def profile_asset_plan(assets_root: Path):
+def profile_asset_plan(assets_root: Path, kit: str = ""):
     """Split a profile's asset tree into (agent-level, project-level) file lists.
 
     `agent/` and `project/` are explicit targets; every other root entry mirrors
-    ~/.claude, which is the default level.
+    ~/.claude, which is the default level. The declared kit directory is the
+    build context for `sbx create --kit`, not a Claude asset, so it is excluded
+    before the file and size rails apply.
     """
     agent, project = [], []
     for entry in sorted(assets_root.iterdir(), key=lambda item: item.name):
         if entry.name in PROFILE_DEFINITION_NAMES:
+            continue
+        if kit and entry.name == kit:
             continue
         if entry.is_symlink():
             raise ProfileError(
@@ -1855,10 +2185,10 @@ def _push_asset_tree(level: str, files, workspace: Path, target: str, display: s
     sbx(["exec", "-i", name(), "sh", "-c", command], check=True)
 
 
-def install_profile_assets(profile_name: str, assets_root: Path) -> None:
+def install_profile_assets(profile_name: str, assets_root: Path, kit: str = "") -> None:
     """Copy a profile's asset tree into the sandbox, at agent and/or project level."""
     try:
-        agent_files, project_files = profile_asset_plan(assets_root)
+        agent_files, project_files = profile_asset_plan(assets_root, kit)
         if not agent_files and not project_files:
             return
         if project_files and not path():
@@ -1894,7 +2224,7 @@ def install_profile_assets(profile_name: str, assets_root: Path) -> None:
 
 
 def split_profile_names(raw: str):
-    """The -profile list, trimmed, without blanks or duplicates, order preserved."""
+    """A profile list, trimmed, without blanks or duplicates, order preserved."""
     names = []
     for item in raw.split(","):
         item = item.strip()
@@ -1903,40 +2233,94 @@ def split_profile_names(raw: str):
     return names
 
 
-def load_profile_sources():
+def load_profile_sources(allow_kits: bool = True):
     """Resolve, parse and asset-check every selected profile, applying nothing.
 
     Doing this before `sbx create` means a typo'd profile name or an invalid bundle
     aborts while nothing exists yet, instead of leaving a created sandbox behind
     that has no saved config and has to be removed by hand.
+
+    `allow_kits=False` is used by docker-sbx-apply-profile.py: a kit is a
+    create-time build context, and pretending to apply one to a live sandbox
+    would silently do nothing.
     """
-    names = split_profile_names(profiles())
-    if not names:
+    policy_names = split_profile_names(profiles())
+    bundle_names = directory_names()
+    if not policy_names and not bundle_names:
         return []
-    profiles_dir = Path(profile_directory()) if profile_directory() else script_dir() / "profiles"
-    if not profiles_dir.is_dir():
-        die(f"profile directory '{profiles_dir}' does not exist")
+    base = Path(profiles_dir()) if profiles_dir() else script_dir() / "profiles"
+    if not base.is_dir():
+        die(f"profiles directory '{base}' does not exist")
 
     sources = []
-    for profile_name in names:
-        try:
-            source = resolve_profile(profiles_dir, profile_name)
-            allowed, denied = load_profile(str(source.definition))
-            if source.assets_root is not None:
-                profile_asset_plan(source.assets_root)
-        except ProfileError as exc:
-            die(str(exc))
+
+    def add(source, policy_name):
+        allowed, denied, kit = load_profile(str(source.definition), source.assets_root)
+        source.kit = kit
+        if kit:
+            if not allow_kits:
+                raise ProfileError(
+                    f"profile '{policy_name}' includes a sandbox kit, which can "
+                    "only be used when the sandbox is created. Create a new "
+                    f"sandbox with -profile-directory {policy_name}, or recreate "
+                    "one whose saved config already includes it."
+                )
+            source.kit_path = (source.assets_root / kit).resolve()
+        if source.assets_root is not None:
+            profile_asset_plan(source.assets_root, kit)
         sources.append((source, allowed, denied))
+
+    try:
+        # Flat policy profiles: -profile-policy only.
+        for profile_name in policy_names:
+            source = resolve_profile(base, profile_name)
+            if source.assets_root is not None:
+                raise ProfileError(
+                    f"profile '{profile_name}' is a directory profile; select it "
+                    f"with -profile-directory {profile_name}"
+                )
+            add(source, profile_name)
+
+        # Directory bundles: -profile-directory only.
+        for profile_name in bundle_names:
+            source = resolve_profile(base, profile_name)
+            if source.assets_root is None:
+                raise ProfileError(
+                    f"profile '{profile_name}' is a flat policy profile; select it "
+                    f"with -profile-policy {profile_name}"
+                )
+            add(source, profile_name)
+    except ProfileError as exc:
+        die(str(exc))
     return sources
 
 
-def validate_profiles() -> None:
+def validate_profiles(allow_kits: bool = True) -> None:
     """Fail on a bad profile before a sandbox is created or touched."""
-    load_profile_sources()
+    load_profile_sources(allow_kits)
+
+
+def profile_kit_args():
+    """The `--kit <path>` arguments contributed by the selected profiles."""
+    args = []
+    seen = set()
+    for source, _allowed, _denied in load_profile_sources():
+        if not source.kit_path:
+            continue
+        path = str(source.kit_path)
+        if path in seen:
+            continue
+        seen.add(path)
+        args.extend(["--kit", path])
+    if args:
+        info()
+        for index in range(0, len(args), 2):
+            info(f"Selecting sandbox kit: {args[index + 1]}")
+    return args
 
 
 def apply_profiles() -> None:
-    if not profiles():
+    if not profiles() and not profile_directories():
         return
 
     sources = load_profile_sources()
@@ -1948,6 +2332,10 @@ def apply_profiles() -> None:
 
     for source, allowed, denied in sources:
         info(f"Loading profile: {source.name}")
+        if source.kit_path:
+            # The kit was built and merged into the sandbox by `sbx create`; the
+            # profile's network rules and Claude assets still apply here.
+            info(f"  sandbox kit: {source.kit_path} (applied at creation)")
 
         for domain in allowed:
             info(f"  allowing {domain}")
@@ -1958,7 +2346,7 @@ def apply_profiles() -> None:
 
         if source.assets_root is not None:
             try:
-                install_profile_assets(source.name, source.assets_root)
+                install_profile_assets(source.name, source.assets_root, source.kit)
             except ProfileError as exc:
                 die(str(exc))
 
@@ -1995,6 +2383,10 @@ def secretsfile() -> str:
     return CONFIG.secretsfile
 
 
+def protected_paths() -> str:
+    return CONFIG.protected_paths
+
+
 def volumes():
     return CONFIG.volumes
 
@@ -2003,8 +2395,16 @@ def profiles() -> str:
     return CONFIG.profiles
 
 
-def profile_directory() -> str:
-    return CONFIG.profile_directory
+def profile_directories():
+    return CONFIG.profile_directories
+
+
+def directory_names():
+    return split_profile_names(",".join(profile_directories()))
+
+
+def profiles_dir() -> str:
+    return CONFIG.profiles_dir
 
 
 def main_update(argv=None) -> int:
@@ -2037,8 +2437,11 @@ def main_update(argv=None) -> int:
     if not name():
         banner("Missing parameter, you must provide the sandbox name with -n")
         usage(1, "update")
-    if not profiles():
-        die("-profile is required: a comma-separated list of profile names")
+    if not profiles() and not profile_directories():
+        die(
+            "at least one of -profile-policy or -profile-directory is required "
+            "(comma-separated or repeated names)"
+        )
 
     if not DRY_RUN and not have("sbx"):
         die(
@@ -2065,12 +2468,14 @@ def main_update(argv=None) -> int:
             )
         else:
             CONFIG.path = data["project"]
-            if not CONFIG.profile_directory and data["profile_directory"]:
-                CONFIG.profile_directory = data["profile_directory"]
+            if not CONFIG.profiles_dir and data["profiles_dir"]:
+                CONFIG.profiles_dir = data["profiles_dir"]
 
     # Validate everything before changing the sandbox: a later profile must not
-    # fail after an earlier one's rules and files were already applied.
-    validate_profiles()
+    # fail after an earlier one's rules and files were already applied. A kit is
+    # create-time only, so a kit-bearing profile is refused here rather than
+    # applying its network rules and silently skipping the toolchain.
+    validate_profiles(allow_kits=False)
 
     if not DRY_RUN:
         # existing_sandbox_names() answers [] both for an empty list and for a
@@ -2098,7 +2503,7 @@ def main_update(argv=None) -> int:
         )
 
     apply_profiles()
-    update_saved_config(split_profile_names(profiles()))
+    update_saved_config(split_profile_names(profiles()), directory_names())
     return 0
 
 
@@ -2189,8 +2594,13 @@ def main(argv=None) -> int:
     if not os.path.isdir(CONFIG.path):
         die(f"project path '{CONFIG.path}' does not exist or is not a directory")
 
-    if CONFIG.profile_directory and not os.path.isdir(CONFIG.profile_directory):
-        die(f"profile directory '{CONFIG.profile_directory}' does not exist")
+    if CONFIG.profiles_dir and not os.path.isdir(CONFIG.profiles_dir):
+        die(f"profiles directory '{CONFIG.profiles_dir}' does not exist")
+
+    protected = protected_paths().strip().lower()
+    if protected not in ("true", "false"):
+        die("-protected-paths must be true or false")
+    CONFIG.protected_paths = protected
 
     # The arguments the user passed are checked before the environment they are
     # passed in: the bash implementation has no `sbx` precondition, so validating

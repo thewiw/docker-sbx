@@ -1,2 +1,5 @@
 name: example
 description: Example profile bundle - shows agent-level and project-level assets
+# Optional: a directory inside this bundle that holds a v3 sandbox kit. When set,
+# `-profile-directory example` also passes the kit to `sbx create --kit` at creation.
+# kit: kit

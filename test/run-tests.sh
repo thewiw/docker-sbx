@@ -1151,6 +1151,19 @@ printf '# demo command\n' > "$PROFILES/bundled/project/commands/demo.md"
 printf 'name: node\npolicies:\n  network:\n    allow:\n      - registry.npmjs.org\n' \
   > "$PROFILES/node/profile.yaml"
 printf 'node skill\n' > "$PROFILES/node/skills/node/SKILL.md"
+# A flat policy profile, selected only with -profile-policy.
+printf 'name: flat\npolicies:\n  network:\n    allow:\n      - example.com\n' \
+  > "$PROFILES/flat.yaml"
+
+# A directory profile that carries a sandbox kit. The kit directory is the
+# build context for `sbx create --kit`; it must never be copied as a Claude
+# asset.
+mkdir -p "$PROFILES/flutter-sdk/kit"
+printf 'name: flutter-sdk\ndescription: test kit profile\nkit: kit\npolicies:\n  network:\n    allow:\n      - pub.dev\n' \
+  > "$PROFILES/flutter-sdk/profile.yaml"
+printf '# syntax=docker/sandbox-kit:3\nschemaVersion: "3"\nkind: mixin\n' \
+  > "$PROFILES/flutter-sdk/kit/flutter.yaml"
+printf 'FROM scratch\n' > "$PROFILES/flutter-sdk/kit/flutter.dockerfile"
 
 # ----------------------------------------------------------------------
 # TEST 27: create with a bundled profile installs its assets and records it
@@ -1163,7 +1176,7 @@ reset_stub
 STUB_NAMES=""
 CREATE_RC=0
 CREATE_OUT="$(run_stub_create -n "$BUNDLE_NAME" -p "$NEW_PROJECT" -s false \
-  -profile bundled -profile-directory "$PROFILES" --config-dir "$CFG_DIR" 2>&1)" || CREATE_RC=$?
+  -profile-directory bundled -profiles-dir "$PROFILES" --config-dir "$CFG_DIR" 2>&1)" || CREATE_RC=$?
 if [[ "$CREATE_RC" == "0" ]]; then
   pass "Create returned success"
 else
@@ -1173,9 +1186,10 @@ if [[ -f "$CFG_PATH" ]] \
    && grep -q '^version: 1$' "$CFG_PATH" \
    && grep -qF "$BUNDLE_NAME" "$CFG_PATH" \
    && grep -q '^project:' "$CFG_PATH" \
+   && grep -q '^profile_directories:$' "$CFG_PATH" \
    && grep -qF "'bundled'" "$CFG_PATH" \
-   && grep -q '^profile_directory:' "$CFG_PATH"; then
-  pass "The saved config records version, name, project, profile and profile directory"
+   && grep -q '^profiles_dir:' "$CFG_PATH"; then
+  pass "The saved config records version, name, project, directory profile and profiles dir"
 else
   fail "Saved config is missing fields: $(cat "$CFG_PATH" 2>/dev/null || echo missing)"
 fi
@@ -1245,7 +1259,7 @@ PYTHON_BIN="$(command -v python3)"
 DRY_RC=0
 DRY_OUT="$(env PATH="$EMPTY_BIN" SBX_STUB_LOG="$STUB_LOG" "$PYTHON_BIN" "$CREATE_SCRIPT" \
   --dry-run -n new-dry -p "$NEW_PROJECT" -s false \
-  -profile bundled -profile-directory "$PROFILES" --config-dir "$DRY_CFG" 2>&1)" || DRY_RC=$?
+  -profile-directory bundled -profiles-dir "$PROFILES" --config-dir "$DRY_CFG" 2>&1)" || DRY_RC=$?
 if [[ "$DRY_RC" == "0" ]]; then
   pass "Dry run returned success without sbx on PATH"
 else
@@ -1291,8 +1305,8 @@ EOF
 reset_stub
 STUB_NAMES="$UPDATE_NAME"
 UPDATE_RC=0
-UPDATE_OUT="$(run_stub_apply -n "$UPDATE_NAME" -profile node \
-  -profile-directory "$PROFILES" --config-dir "$UPDATE_CFG" 2>&1)" || UPDATE_RC=$?
+UPDATE_OUT="$(run_stub_apply -n "$UPDATE_NAME" -profile-directory node \
+  -profiles-dir "$PROFILES" --config-dir "$UPDATE_CFG" 2>&1)" || UPDATE_RC=$?
 if [[ "$UPDATE_RC" == "0" ]]; then
   pass "Profile update returned success for an existing sandbox"
 else
@@ -1310,8 +1324,9 @@ else
   fail "The new profile was not fully applied: $(cat "$STUB_LOG")"
 fi
 if grep -qF "'python'" "$UPDATE_CFG/$UPDATE_NAME.yaml" \
+   && grep -q '^profile_directories:$' "$UPDATE_CFG/$UPDATE_NAME.yaml" \
    && grep -qF "'node'" "$UPDATE_CFG/$UPDATE_NAME.yaml"; then
-  pass "The config now lists both the old and the new profile"
+  pass "The config lists the policy and the new directory profile"
 else
   fail "The config was not updated: $(cat "$UPDATE_CFG/$UPDATE_NAME.yaml" 2>/dev/null || echo missing)"
 fi
@@ -1322,7 +1337,8 @@ else
 fi
 # The update flow is no longer reachable from the create script.
 REJECT_RC=0
-REJECT_OUT="$(run_stub_create -n "$UPDATE_NAME" -profile node --apply-profile 2>&1)" || REJECT_RC=$?
+REJECT_OUT="$(run_stub_create -n "$UPDATE_NAME" -profile-directory node \
+  -profiles-dir "$PROFILES" --apply-profile 2>&1)" || REJECT_RC=$?
 if [[ "$REJECT_RC" != "0" ]] \
    && printf '%s\n' "$REJECT_OUT" | grep -qF "Unknown option: --apply-profile"; then
   pass "The create script rejects the retired --apply-profile flag"
@@ -1396,9 +1412,9 @@ version: 1
 name: '$IMPORT_NAME'
 project: '$NEW_PROJECT'
 scan_secrets: false
-profiles:
+profile_directories:
   - 'node'
-profile_directory: '$PROFILES'
+profiles_dir: '$PROFILES'
 volumes:
   - '$IMPORT_RO:ro'
   - '$IMPORT_RW:rw'
@@ -1429,6 +1445,7 @@ else
   fail "Volume arguments are wrong: $IMPORT_CREATE_LINE"
 fi
 if [[ -f "$IMPORT_CFG/$IMPORT_NAME.yaml" ]] \
+   && grep -q '^profile_directories:$' "$IMPORT_CFG/$IMPORT_NAME.yaml" \
    && grep -qF "'node'" "$IMPORT_CFG/$IMPORT_NAME.yaml"; then
   pass "The imported sandbox gets its own config under --config-dir"
 else
@@ -1450,7 +1467,7 @@ reset_stub
 STUB_NAMES=""
 BAD_RC=0
 BAD_OUT="$(run_stub_create -n "$BAD_NAME" -p "$NEW_PROJECT" -s false \
-  -profile invalid -profile-directory "$BAD_PROFILES" --config-dir "$BAD_CFG" 2>&1)" || BAD_RC=$?
+  -profile-directory invalid -profiles-dir "$BAD_PROFILES" --config-dir "$BAD_CFG" 2>&1)" || BAD_RC=$?
 if [[ "$BAD_RC" != "0" ]]; then
   pass "Creation aborts on an invalid profile bundle"
 else
@@ -1470,6 +1487,205 @@ if [[ ! -f "$BAD_CFG/$BAD_NAME.yaml" ]]; then
   pass "No config is written for a failed bundle"
 else
   fail "A config was written despite the failure"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 34: a profile kit reaches sbx create, and the kit dir is not an asset
+# ----------------------------------------------------------------------
+echo "TEST 34: a profile kit reaches sbx create, and the kit dir is not an asset"
+KIT_NAME="new-kit"
+KIT_CFG="$TMPDIR/cfg-kit"
+reset_stub
+STUB_NAMES=""
+KIT_RC=0
+KIT_OUT="$(run_stub_create -n "$KIT_NAME" -p "$NEW_PROJECT" -s false \
+  -profile-directory node -profile-directory flutter-sdk -profiles-dir "$PROFILES" \
+  --config-dir "$KIT_CFG" 2>&1)" || KIT_RC=$?
+if [[ "$KIT_RC" == "0" ]]; then
+  pass "Create with a kit-bearing profile returned success"
+else
+  fail "Create with a kit-bearing profile returned $KIT_RC: $KIT_OUT"
+fi
+KIT_CREATE_LINE="$(grep -m1 '^create ' "$STUB_LOG" || true)"
+if printf '%s\n' "$KIT_CREATE_LINE" | grep -qF -- "--kit $PROFILES/flutter-sdk/kit"; then
+  pass "The kit directory is passed to sbx create --kit as an absolute path"
+else
+  fail "The kit was not passed to sbx create: $KIT_CREATE_LINE"
+fi
+if grep -qF "policy allow network --sandbox $KIT_NAME registry.npmjs.org" "$STUB_LOG" \
+   && grep -qF "policy allow network --sandbox $KIT_NAME pub.dev" "$STUB_LOG"; then
+  pass "Both repeated -profile-directory values contribute their network rules"
+else
+  fail "The repeated profile rules were not all applied: $(cat "$STUB_LOG")"
+fi
+if [[ -f "$KIT_CFG/$KIT_NAME.yaml" ]] \
+   && grep -q '^profile_directories:$' "$KIT_CFG/$KIT_NAME.yaml" \
+   && grep -qF "'node'" "$KIT_CFG/$KIT_NAME.yaml" \
+   && grep -qF "'flutter-sdk'" "$KIT_CFG/$KIT_NAME.yaml"; then
+  pass "The saved config records both directory profiles, including the kit profile"
+else
+  fail "The saved config is missing a profile: $(cat "$KIT_CFG/$KIT_NAME.yaml" 2>/dev/null || echo missing)"
+fi
+if tar -tzf "$STUB_COPY/agent.tgz" 2>/dev/null | grep -q '^skills/node/SKILL.md$' \
+   && ! tar -tzf "$STUB_COPY/agent.tgz" 2>/dev/null | grep -q '^kit/'; then
+  pass "The Claude asset tarball carries the skill but not the kit build context"
+else
+  fail "Unexpected asset tarball contents: $(tar -tzf "$STUB_COPY/agent.tgz" 2>/dev/null || echo missing)"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 35: apply-profile refuses a kit-bearing profile
+# ----------------------------------------------------------------------
+echo "TEST 35: apply-profile refuses a kit-bearing profile"
+KIT_UPDATE_NAME="existing-kit"
+KIT_UPDATE_CFG="$TMPDIR/cfg-kit-update"
+mkdir -p "$KIT_UPDATE_CFG"
+cat > "$KIT_UPDATE_CFG/$KIT_UPDATE_NAME.yaml" << EOF
+version: 1
+name: '$KIT_UPDATE_NAME'
+project: '$NEW_PROJECT'
+scan_secrets: false
+EOF
+reset_stub
+STUB_NAMES="$KIT_UPDATE_NAME"
+KIT_UP_RC=0
+KIT_UP_OUT="$(run_stub_apply -n "$KIT_UPDATE_NAME" -profile-directory flutter-sdk \
+  -profiles-dir "$PROFILES" --config-dir "$KIT_UPDATE_CFG" 2>&1)" || KIT_UP_RC=$?
+if [[ "$KIT_UP_RC" != "0" ]] \
+   && printf '%s\n' "$KIT_UP_OUT" | grep -qF "includes a sandbox kit"; then
+  pass "The update command refuses a kit-bearing profile"
+else
+  fail "The update command did not refuse the kit profile: $KIT_UP_OUT"
+fi
+if ! grep -qE '^(create|exec|cp|policy)( |$)' "$STUB_LOG"; then
+  pass "Nothing is created or touched when the profile carries a kit"
+else
+  fail "The refused update touched the sandbox: $(cat "$STUB_LOG")"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 36: -profile-policy and -profile-directory are strict about kind
+# ----------------------------------------------------------------------
+echo "TEST 36: -profile-policy and -profile-directory are strict about kind"
+POLICY_KIND_RC=0
+POLICY_KIND_OUT="$(run_stub_create -n new-kind -p "$NEW_PROJECT" -s false \
+  --dry-run -profile-policy bundled -profiles-dir "$PROFILES" \
+  --config-dir "$TMPDIR/cfg-kind" 2>&1)" || POLICY_KIND_RC=$?
+if [[ "$POLICY_KIND_RC" != "0" ]] \
+   && printf '%s\n' "$POLICY_KIND_OUT" | grep -qF \
+      "is a directory profile; select it with -profile-directory bundled"; then
+  pass "-profile-policy refuses a directory profile and names the right flag"
+else
+  fail "-profile-policy accepted or misreported a directory profile: $POLICY_KIND_OUT"
+fi
+DIRECTORY_KIND_RC=0
+DIRECTORY_KIND_OUT="$(run_stub_create -n new-kind -p "$NEW_PROJECT" -s false \
+  --dry-run -profile-directory flat -profiles-dir "$PROFILES" \
+  --config-dir "$TMPDIR/cfg-kind" 2>&1)" || DIRECTORY_KIND_RC=$?
+if [[ "$DIRECTORY_KIND_RC" != "0" ]] \
+   && printf '%s\n' "$DIRECTORY_KIND_OUT" | grep -qF \
+      "is a flat policy profile; select it with -profile-policy flat"; then
+  pass "-profile-directory refuses a flat policy profile and names the right flag"
+else
+  fail "-profile-directory accepted or misreported a flat profile: $DIRECTORY_KIND_OUT"
+fi
+FLAT_RC=0
+FLAT_OUT="$(run_stub_create -n new-kind -p "$NEW_PROJECT" -s false \
+  --dry-run -profile-policy flat -profiles-dir "$PROFILES" \
+  --config-dir "$TMPDIR/cfg-kind" 2>&1)" || FLAT_RC=$?
+if [[ "$FLAT_RC" == "0" ]] && printf '%s\n' "$FLAT_OUT" | grep -qF "allowing example.com"; then
+  pass "-profile-policy accepts a flat policy profile"
+else
+  fail "-profile-policy did not apply the flat policy: $FLAT_OUT"
+fi
+
+# ----------------------------------------------------------------------
+# TEST 37: the protected-path guard blocks the tools and Bash
+# ----------------------------------------------------------------------
+echo "TEST 37: the protected-path guard blocks the tools and Bash"
+GUARD="$SCRIPTS_DIR/sandbox/docker-sbx-guard-protected-paths.sh"
+guard_check() {
+  local label="$1" expected="$2" payload="$3"
+  local rc=0
+  printf '%s' "$payload" | bash "$GUARD" >/dev/null 2>"$TMPDIR/guard.err" || rc=$?
+  if [[ "$rc" == "$expected" ]]; then
+    pass "$label"
+  else
+    fail "$label (expected rc $expected, got $rc: $(cat "$TMPDIR/guard.err"))"
+  fi
+}
+guard_check "Bash naming google-services.json is blocked" 2 \
+  '{"tool_name":"Bash","tool_input":{"command":"cat google-services.json"}}'
+guard_check "Quoted or escaped names are still blocked" 2 \
+  '{"tool_name":"Bash","tool_input":{"command":"cat google\\-services.json"}}'
+guard_check "Read of GoogleService-Info.plist is blocked" 2 \
+  '{"tool_name":"Read","tool_input":{"file_path":"/c/proj/GoogleService-Info.plist"}}'
+guard_check "Write of launch.json is blocked" 2 \
+  '{"tool_name":"Write","tool_input":{"file_path":".vscode/launch.json"}}'
+guard_check "Grep aimed at a protected file is blocked" 2 \
+  '{"tool_name":"Grep","tool_input":{"path":"/c/proj/google-services.json","pattern":"x"}}'
+guard_check "An unrelated Bash command is allowed" 0 \
+  '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}'
+guard_check "An unrelated Read is allowed" 0 \
+  '{"tool_name":"Read","tool_input":{"file_path":"/c/proj/README.md"}}'
+if grep -qF "protected by docker-sbx" "$TMPDIR/guard.err" 2>/dev/null; then
+  pass "The block message names the protection"
+else
+  # The last check was allowed; run one block again for the message.
+  printf '%s' '{"tool_name":"Bash","tool_input":{"command":"cat launch.json"}}' \
+    | bash "$GUARD" >/dev/null 2>"$TMPDIR/guard.err" || true
+  if grep -qF "protected by docker-sbx" "$TMPDIR/guard.err"; then
+    pass "The block message names the protection"
+  else
+    fail "The block message is missing: $(cat "$TMPDIR/guard.err")"
+  fi
+fi
+
+# ----------------------------------------------------------------------
+# TEST 38: protected-path hook installation is idempotent and removable
+# ----------------------------------------------------------------------
+echo "TEST 38: protected-path hook installation is idempotent and removable"
+PG_HOME="$TMPDIR/protect-home"
+PG_SETTINGS="$PG_HOME/.claude/settings.json"
+mkdir -p "$PG_HOME/.claude"
+printf '{}\n' > "$PG_SETTINGS"
+stage_guard() { cp "$GUARD" "$PG_HOME/guard-protected-paths.sh"; }
+install_guard() {
+  stage_guard
+  HOME="$PG_HOME" bash -c \
+    "source '$INSTALLER_FNS'; protectedpaths=true; install_protected_paths_hook" \
+    >/dev/null 2>&1 || true
+}
+install_guard
+if [[ -x "$PG_HOME/.claude/hooks/guard-protected-paths.sh" ]]; then
+  pass "The guard hook is installed and executable"
+else
+  fail "The guard hook was not installed"
+fi
+if [[ "$(jq -r '[.hooks.PreToolUse[]? | .hooks[]? | select(.command|endswith("guard-protected-paths.sh"))] | length' "$PG_SETTINGS" 2>/dev/null || echo err)" == "1" ]]; then
+  pass "settings.json has one PreToolUse entry for the guard"
+else
+  fail "Unexpected PreToolUse entries: $(cat "$PG_SETTINGS" 2>/dev/null || echo missing)"
+fi
+if [[ "$(jq -r '[.hooks.PreToolUse[]? | select(.matcher|test("Bash")) | .matcher] | length' "$PG_SETTINGS" 2>/dev/null || echo err)" == "1" ]]; then
+  pass "The entry matches the Bash and file tools"
+else
+  fail "The guard matcher is missing: $(cat "$PG_SETTINGS" 2>/dev/null || echo missing)"
+fi
+install_guard
+if [[ "$(jq -r '[.hooks.PreToolUse[]? | .hooks[]? | select(.command|endswith("guard-protected-paths.sh"))] | length' "$PG_SETTINGS" 2>/dev/null || echo err)" == "1" ]]; then
+  pass "Re-running setup does not duplicate the guard entry"
+else
+  fail "The guard entry was duplicated or lost: $(cat "$PG_SETTINGS" 2>/dev/null || echo missing)"
+fi
+HOME="$PG_HOME" bash -c \
+  "source '$INSTALLER_FNS'; protectedpaths=false; install_protected_paths_hook" \
+  >/dev/null 2>&1 || true
+if [[ ! -e "$PG_HOME/.claude/hooks/guard-protected-paths.sh" ]] \
+   && [[ "$(jq -r '[.hooks.PreToolUse[]? | .hooks[]? | select(.command|endswith("guard-protected-paths.sh"))] | length' "$PG_SETTINGS" 2>/dev/null || echo err)" == "0" ]]; then
+  pass "protectedpaths=false removes the hook and its settings entry"
+else
+  fail "Disabling left the guard behind: $(cat "$PG_SETTINGS" 2>/dev/null || echo missing)"
 fi
 
 # ----------------------------------------------------------------------

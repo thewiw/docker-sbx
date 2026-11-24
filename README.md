@@ -163,22 +163,31 @@ The cross-platform Python version (Linux, WSL, macOS, Windows) takes exactly the
 
     python3 docker-sbx-create-sandbox.py -n test01 -p /absolute/project/path
 
-Add `--dry-run` to print every command without creating anything.
+Add `--dry-run` to print every command without creating anything. `--help` also lists the
+available `-profile-policy` and `-profile-directory` profiles, with each profile's
+description.
 
 ```
-python3 docker-sbx-create-sandbox.py -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -v {path} -profile {comma-separated profile names} -profile-directory {path to profile directory} :
-  -n                  : name of the sandbox [[mandatory]]
-  -p                  : absolute path of the project's files [[mandatory]]
-  -e                  : path to environment file [[optional]]
-  -s                  : check secrets [[optional, true by default]]
+python3 docker-sbx-create-sandbox.py -n [sandbox name] -p [absolute path] -e {path to env file} -s {true/false} -protected-paths {true/false} -sf {path to secrets files settings} -gsf {path to secrets files settings} -v {path} -profile-policy {policy names} -profile-directory {bundle names} -profiles-dir {path} :
+  -n, -name           : name of the sandbox [[mandatory]]
+  -p, -project        : absolute path of the project's files [[mandatory]]
+  -e, -env            : path to environment file [[optional]]
+  -s, -scan-secrets   : check secrets [[optional, true by default]]
+  -protected-paths    : install the Claude Code protected-path guard [[optional, true by default]]
+                        Blocks Read/Write/Edit/Bash access (and related tools) to GoogleService-Info.plist,
+                        google-services.json and launch.json. Accepts -protected-paths=false.
   -sf                 : path to secrets files settings [[optional, uses default settings if missing]]
   -gsf                : generate a default secrets files settings and exit, parameter is path to secrets files settings [[optional]]
-  -v                  : extra host directory/file to mount into the sandbox (absolute path) [[optional, repeatable]]
-  -profile            : comma-separated list of policy profiles to apply (e.g. python,java) [[optional]]
-  -profile-directory  : directory containing profile YAML files and bundles [[optional, default: ./profiles]]
+  -v, -volume         : extra host directory/file to mount into the sandbox (absolute path) [[optional, repeatable]]
+  -profile-policy     : flat policy profiles to apply, in order; comma-separate or repeat
+                        (e.g. -profile-policy python,java) [[optional]]
+  -profile-directory  : directory profile bundles to apply, in order; comma-separate or
+                        repeat (e.g. -profile-directory flutter-sdk) [[optional]]
+  -profiles-dir       : base directory both selectors resolve against
+                        [[optional, default: ./profiles]]
   --recreate          : rebuild sandbox -n from its saved config (refuses if it already exists)
   --force             : with --recreate, remove the existing sandbox first (sbx rm)
-  --from-config FILE  : create from a saved config instead of -n/-p/-e/-s/-sf/-v/-profile/-profile-directory
+  --from-config FILE  : create from a saved config instead of -n/-p/-e/-s/-sf/-v/-profile-policy/-profile-directory/-profiles-dir
   --config-dir DIR    : directory holding <sandbox>.yaml config files
                         [[optional, default: the platform config directory]]
   --no-config         : do not write a sandbox config file
@@ -187,6 +196,11 @@ python3 docker-sbx-create-sandbox.py -n [sandbox name] -p [absolute path] -e {pa
 A successful creation ends by printing the saved config's path and a ready-to-copy rebuild
 command. That saved config is what `--recreate` uses later; see
 [Per-sandbox configuration](#per-sandbox-configuration).
+
+Normal runs do not echo the internal `sbx` calls (`ls`, `cp`, `exec`, `policy`, …):
+`sbx create` keeps its own KITS/SANDBOX/IMAGE/AGENT progress. `--dry-run` still prints
+every command. When profiles are selected, the policy and directory names are listed
+directly under the `Creating sandbox` banner.
 
 The setup step **waits for the sandbox's first start to finish** before configuring it. That first
 start is when the guest gets its agent — the `claude` binary is downloaded then, so it can take a
@@ -241,22 +255,22 @@ python3 docker-sbx-create-sandbox.py -gsf secrets.json
 
 Use a Python profile to allow access to PyPI:
 ```
-python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile python
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile-policy python
 ```
 
 Use multiple profiles (order matters):
 ```
-python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile python,node
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile-policy python,node
 ```
 
 Use a custom profile directory:
 ```
-python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile myprofile -profile-directory $HOME/my-profiles
+python3 docker-sbx-create-sandbox.py -n test01 -p $HOME/projects/test01 -profile-directory mybundle -profiles-dir $HOME/my-profiles
 ```
 
 Apply another profile to an existing sandbox (no secret scan, no setup re-run):
 ```
-python3 docker-sbx-apply-profile.py -n test01 -profile node
+python3 docker-sbx-apply-profile.py -n test01 -profile-directory node
 ```
 
 Rebuild a sandbox from the config saved when it was created (`--recreate` refuses if the
@@ -304,6 +318,25 @@ ANTHROPIC_AUTH_TOKEN=ollama
 ```
 
 
+## Protected paths
+
+By default (`-protected-paths true`, or omitted), the sandbox installs a Claude Code
+`PreToolUse` hook that blocks the **Read**, **Write**, **Edit**, **MultiEdit**,
+**NotebookEdit** and **Bash** tools when the call names one of:
+
+- `GoogleService-Info.plist`
+- `google-services.json`
+- `launch.json`
+
+The hook lives in `~/.claude/hooks/guard-protected-paths.sh` and is wired into
+`~/.claude/settings.json`. Re-running setup does not duplicate it; `-protected-paths false`
+skips it and removes an existing entry when setup is re-run. The flag is recorded in the
+saved config so `--recreate` preserves the choice.
+
+Like any text-match hook, it stops accidental access and obvious commands, not deliberate
+obfuscation (a variable, a helper script, a glob). For a hard boundary, keep the files out
+of the project/volumes or make them unreadable by the agent user.
+
 ## Policy Profiles
 
 By default every sandbox shares the same restrictive network policy. A **profile** adds
@@ -312,11 +345,28 @@ without opening that domain up for every sandbox. A profile can also carry **ass
 skills, commands, agents, workflows or a `CLAUDE.md` — that are copied into the sandbox.
 
 A profile is either a flat `<name>.yaml` file (network rules only, as before) or a
-self-contained directory `<name>/` holding a `profile.yaml` plus an asset tree. Profiles
-live in the `./profiles` directory (or the directory given with `-profile-directory`) and
-are selected with `-profile`. They are applied after all standard rules, so profile rules
-take precedence over standard rules. Defining the same name both as a directory and as a
-flat YAML file is an error rather than a silent precedence rule.
+self-contained directory `<name>/` holding a `profile.yaml` plus an asset tree and,
+optionally, a **sandbox kit**. Profiles live in the `./profiles` directory (or the
+directory given with `-profiles-dir`).
+
+The two kinds are selected with separate options:
+
+- `-profile-policy python,java` selects flat policy profiles only;
+- `-profile-directory flutter-sdk` selects directory bundles only.
+
+Each option is repeatable and comma-separable. Mixing kinds is refused: a directory
+bundle named in `-profile-policy` produces an error naming `-profile-directory`, and a
+flat policy named in `-profile-directory` produces the reverse. Policies are applied
+first, then directory bundles; both are applied after all standard rules, so profile
+rules take precedence over standard rules. Defining the same name both as a directory
+and as a flat YAML file is an error rather than a silent precedence rule.
+
+A directory profile may declare `kit: <dir>`, where `<dir>` is a single directory name
+inside the profile bundle. That directory is passed to `sbx create --kit` at creation, so
+the toolchain it describes is built into the sandbox image. The kit directory is **not**
+copied into `~/.claude`. A kit can only be selected when the sandbox is created:
+`docker-sbx-apply-profile.py` refuses a kit-bearing profile rather than applying half of it
+to a live sandbox.
 
 ### Profile format
 
@@ -333,18 +383,31 @@ policies:
       - bad.example.com
 ```
 
+A directory profile uses the same schema and may add a kit:
+
+```yaml
+name: flutter-sdk
+description: Flutter, Dart and Android SDK toolchain
+kit: flutter
+policies:
+  network:
+    allow:
+      - pub.dev
+      - storage.googleapis.com
+```
+
 Rules:
 
-- Top-level keys allowed: `name`, `description`, `policies`; any other key is rejected
-  rather than ignored, so a typo cannot silently produce a profile with no rules.
+- Top-level keys allowed: `name`, `description`, `policies`, `kit`; any other key is
+  rejected rather than ignored, so a typo cannot silently produce a profile with no rules.
+- `kit` is a single directory name inside the profile bundle (for example `kit`); absolute
+  paths, `..` and separators are refused. It is only valid in a directory profile, and the
+  directory must contain a kit descriptor (`*.yaml`).
 - `policies.network` may contain only `allow` and `deny`, each a list of non-empty domain
   strings. An entry must look like a host (`example.com`, `*.example.com`): a URL, a path
   or an entry containing whitespace is refused.
 - Any key that would imply a global policy is rejected; profiles are always per-sandbox.
-- Malformed or unknown profiles abort sandbox creation.
-
-A directory profile uses exactly the same schema in its `profile.yaml`; the directory also
-carries assets.
+- Malformed or unknown profiles abort sandbox creation, before anything is created.
 
 ### Profile assets
 
@@ -353,6 +416,7 @@ Everything in a profile directory is an asset except the definition file. The la
 | Path in the profile directory | Installed to |
 |---|---|
 | `profile.yaml` / `profile.yml` | – (the definition itself, never copied) |
+| the declared `kit:` directory | – (build context for `sbx create --kit`, never copied) |
 | `agent/` | `/home/agent/.claude/` |
 | `project/` | `<project>/.claude/` |
 | any other root entry (`skills/`, `agents/`, `commands/`, `workflows/`, `CLAUDE.md`, …) | `/home/agent/.claude/<entry>` |
@@ -377,14 +441,16 @@ Assets are packaged on the host and copied into the sandbox, then unpacked with 
 they are visible on the host as well.
 
 `profiles/example/` is a copyable template for a directory profile: it installs one skill
-at agent level and one command at project level, and defines no network rules. The shipped
-language profiles below remain flat, network-only files.
+at agent level and one command at project level, and defines no network rules.
+`profiles/flutter-sdk/` is a real example of the same form with a `kit:` directory: its
+`flutter/README.md` documents versions, licences and the emulator/architecture limits.
 
 ### Standard profiles
 
-These profiles carry network rules only; a profile directory may additionally carry assets.
+Most profiles carry network rules only; a directory profile may additionally carry assets
+and a sandbox kit.
 
-| Profile | Grants access to |
+| Profile | Grants access to / installs |
 |---|---|
 | `python` | PyPI and test PyPI |
 | `java` | Maven Central and Gradle repositories |
@@ -393,27 +459,41 @@ These profiles carry network rules only; a profile directory may additionally ca
 | `node` | npm and Yarn registries |
 | `rust` | crates.io |
 | `dotnet` | NuGet.org |
-| `flutter` | pub.dev and Google Storage for Flutter SDK / Dart packages |
+| `flutter` | Flutter/Dart package access plus Android build dependencies (network only) |
+| `flutter-sdk` | `flutter`'s network rules **and** a sandbox kit with Flutter, Dart, JDK 17 and the Android SDK |
+
+`flutter-sdk` builds the toolchain into the sandbox image at creation. It requires
+**x86_64** (Google does not publish Linux arm64 Android command-line tools, and Flutter has
+no official linux-arm64 release tarball) and supports `flutter analyze`, `flutter test`,
+`flutter build apk`, `flutter build appbundle` and `flutter build linux`; the Linux desktop
+toolchain (clang, CMake, Ninja, pkg-config, GTK 3) is installed at creation when missing.
+It does **not** include the Android emulator (local sandboxes have no nested KVM), iOS
+builds, or the web/Chrome toolchain.
+The first creation builds and downloads several GB; later sandboxes reuse the cached build.
+The saved config records `flutter-sdk`, so `--recreate` rebuilds it. Kits are an
+**experimental** `sbx` feature: v3 kits need sbx 0.45 or later, and 0.47+ is recommended.
 
 Example:
 
 ```bash
-python3 docker-sbx-create-sandbox.py -n pyproject -p "$HOME/projects/pyproject" -profile python
-python3 docker-sbx-create-sandbox.py -n spring -p "$HOME/projects/spring" -profile java-spring-boot
-python3 docker-sbx-create-sandbox.py -n fullstack -p "$HOME/projects/fullstack" -profile python,node
+python3 docker-sbx-create-sandbox.py -n pyproject -p "$HOME/projects/pyproject" -profile-policy python
+python3 docker-sbx-create-sandbox.py -n spring -p "$HOME/projects/spring" -profile-policy java-spring-boot
+python3 docker-sbx-create-sandbox.py -n fullstack -p "$HOME/projects/fullstack" -profile-policy python,node
+python3 docker-sbx-create-sandbox.py -n mobile -p "$HOME/projects/mobile" -profile-directory flutter-sdk
 ```
 
 
 ## Update a sandbox
 
-`docker-sbx-apply-profile.py` applies `-profile` to a sandbox that already exists, without
-creating it and without repeating its creation options:
+`docker-sbx-apply-profile.py` applies policies and/or directory bundles to a sandbox that
+already exists, without creating it and without repeating its creation options:
 
 ```
-python3 docker-sbx-apply-profile.py -n [sandbox name] -profile [profile names] [-options] :
+python3 docker-sbx-apply-profile.py -n [sandbox name] (-profile-policy names | -profile-directory names) [-options] :
   -n                  : sandbox to update [[mandatory]]
-  -profile            : comma-separated profiles to apply, in order [[mandatory]]
-  -profile-directory  : directory containing profile YAML files and bundles [[optional, default: ./profiles]]
+  -profile-policy     : flat policy profiles to apply, in order; comma-separate or repeat [[optional]]
+  -profile-directory  : directory profile bundles to apply, in order; comma-separate or repeat [[optional]]
+  -profiles-dir PATH  : base directory both selectors resolve against [[optional, default: ./profiles]]
   --config-dir DIR    : directory holding <sandbox>.yaml config files [[optional]]
   --no-config         : do not update the sandbox's saved config
   --dry-run           : print every command that would run, and change nothing
@@ -421,8 +501,9 @@ python3 docker-sbx-apply-profile.py -n [sandbox name] -profile [profile names] [
 
 Examples:
 ```
-python3 docker-sbx-apply-profile.py -n test01 -profile node
-python3 docker-sbx-apply-profile.py -n test01 -profile python,node -profile-directory $HOME/my-profiles
+python3 docker-sbx-apply-profile.py -n test01 -profile-policy python
+python3 docker-sbx-apply-profile.py -n test01 -profile-directory node
+python3 docker-sbx-apply-profile.py -n test01 -profile-policy python,node -profiles-dir $HOME/my-profiles
 ```
 
 - It is **additive only**: network rules are added and asset files are written (overwriting
@@ -433,6 +514,9 @@ python3 docker-sbx-apply-profile.py -n test01 -profile python,node -profile-dire
 - The applied profile names are recorded in the sandbox's saved config (see below),
   deduplicated and in the order given. On success it prints `Config updated: <path>`. If
   the sandbox has no saved config, it warns and records nothing.
+- A **kit-bearing profile** (one whose `profile.yaml` declares `kit:`) is refused: a kit is
+  built into the image at creation and cannot be added to a live sandbox. Create the
+  sandbox with that profile, or recreate one whose saved config already includes it.
 
 
 ## Per-sandbox configuration
@@ -456,34 +540,46 @@ name: test01
 project: /home/me/projects/test01
 env_file: /home/me/private/.anthropic.api.env
 scan_secrets: true
+protected_paths: true
 secrets_settings: /home/me/private/secrets.json
 profiles:
   - python
   - node
-profile_directory: /home/me/my-profiles
+profile_directories:
+  - flutter-sdk
+profiles_dir: /home/me/my-profiles
 volumes:
   - /mnt/c/docs
   - /mnt/c/data:rw
 ```
 
+- `profiles` lists flat policy names; `profile_directories` lists directory bundle names.
+  They are recorded separately so `--recreate` uses the correct selector for each.
+- `protected_paths` records whether the Claude Code protected-path guard was installed
+  (default `true`).
 - The file stores **paths only, never credentials**. `project`, `env_file` and
   `secrets_settings` are stored as absolute paths; the credential values themselves still
   live in the files those paths name.
-- `profile_directory` is omitted when the default `./profiles` is in use, so the file stays
-  portable between checkouts.
+- `profiles_dir` is omitted when the default `./profiles` is in use, so the file stays
+  portable between checkouts. The legacy key `profile_directory` is still accepted when
+  loading an older config and is rewritten as `profiles_dir` when the file is updated.
+- A config written before the policy/directory split, with a directory bundle recorded
+  under `profiles:`, is migrated in memory on load (with a warning) and written in the new
+  form the next time the config is saved. The CLI flags remain strict.
 - Volume entries keep their `path[:ro|:rw]` form exactly as passed with `-v`.
 - The file is plain YAML and can be edited by hand. `version` is `1`; unknown keys are
   rejected when the file is loaded. The script writes, and the dependency-free parser reads,
-  the block form shown above; flow lists such as `profiles: [python]` need PyYAML installed
-  (they are rewritten to block form when `docker-sbx-apply-profile.py` records a new name).
+  the block form shown above; flow lists such as `profiles: [python]` or
+  `profile_directories: [flutter-sdk]` need PyYAML installed (they are rewritten to block
+  form when `docker-sbx-apply-profile.py` records a new name).
 - `--no-config` suppresses writing it, and suppresses the update
   `docker-sbx-apply-profile.py` would otherwise make to it.
 
 `--recreate` loads this file and rebuilds the sandbox; it refuses if the sandbox already
 exists, and `--force` runs `sbx rm` first. `--from-config FILE` creates from any saved
-config (it is mutually exclusive with `-n`, `-p`, `-e`, `-s`, `-sf`, `-v`, `-profile` and
-`-profile-directory`, which the config already contains). Both go through the normal
-creation flow, including the secret scan.
+config (it is mutually exclusive with `-n`, `-p`, `-e`, `-s`, `-sf`, `-v`,
+`-profile-policy`, `-profile-directory` and `-profiles-dir`, which the config already
+contains). Both go through the normal creation flow, including the secret scan.
 
 Because a config can point at credential files, treat it with the same care as the command
 line that produced it. Project-level profile assets are written into the shared project

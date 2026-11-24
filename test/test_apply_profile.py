@@ -47,7 +47,7 @@ class UpdateCommandTests(unittest.TestCase):
         cs.DRY_RUN = self._dry
 
     def _saved_config(
-        self, name="s", profiles=(), profile_directory="", project=None
+        self, name="s", profiles=(), profile_directories=(), profiles_dir="", project=None
     ):
         self.config_dir.mkdir(parents=True, exist_ok=True)
         target = self.config_dir / f"{name}.yaml"
@@ -57,7 +57,8 @@ class UpdateCommandTests(unittest.TestCase):
                 "project": str(project or self.project),
                 "scan_secrets": "false",
                 "profiles": list(profiles),
-                "profile_directory": profile_directory,
+                "profile_directories": list(profile_directories),
+                "profiles_dir": profiles_dir,
             })
         )
         return target
@@ -75,7 +76,7 @@ class UpdateCommandTests(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(
             io.StringIO()
         ), self.assertRaises(SystemExit) as ctx:
-            cs.main_update(["-profile", "python", "--config-dir", str(self.config_dir)])
+            cs.main_update(["-profile-policy", "python", "--config-dir", str(self.config_dir)])
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("you must provide the sandbox name with -n", out.getvalue())
 
@@ -86,7 +87,7 @@ class UpdateCommandTests(unittest.TestCase):
         ), self.assertRaises(SystemExit) as ctx:
             cs.main_update(["-n", "s", "--config-dir", str(self.config_dir)])
         self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("-profile is required", err.getvalue())
+        self.assertIn("at least one of -profile-policy or -profile-directory", err.getvalue())
 
     def test_rejects_unknown_options(self):
         out = io.StringIO()
@@ -104,7 +105,7 @@ class UpdateCommandTests(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(
             io.StringIO()
         ), self.assertRaises(SystemExit) as ctx:
-            cs.main_update(["-n", "s", "-profile", "python", "-p", "/x"])
+            cs.main_update(["-n", "s", "-profile-policy", "python", "-p", "/x"])
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn(
             "Option -p cannot be used with the apply-profile command", out.getvalue()
@@ -116,7 +117,8 @@ class UpdateCommandTests(unittest.TestCase):
             cs.main_update(["-h"])
         self.assertEqual(ctx.exception.code, 0)
         text = out.getvalue()
-        for needle in ("-profile", "--config-dir", "--no-config", "--dry-run"):
+        for needle in ("-profile-policy", "-profile-directory", "-profiles-dir",
+                       "--config-dir", "--no-config", "--dry-run"):
             self.assertIn(needle, text)
         self.assertNotIn("--recreate", text)
 
@@ -128,12 +130,12 @@ class UpdateCommandTests(unittest.TestCase):
             cs, "sbx"
         ) as fake_sbx, contextlib.redirect_stdout(io.StringIO()):
             rc = cs.main_update(
-                ["-n", "s", "-profile", "python,node",
+                ["-n", "s", "-profile-policy", "python,node",
                  "--config-dir", str(self.config_dir)]
             )
         self.assertEqual(rc, 0)
         apply.assert_called_once_with()
-        update.assert_called_once_with(["python", "node"])
+        update.assert_called_once_with(["python", "node"], [])
         fake_sbx.assert_not_called()  # in particular, no `sbx create`
 
     def test_reads_the_saved_project_and_profile_directory(self):
@@ -143,7 +145,7 @@ class UpdateCommandTests(unittest.TestCase):
         profile_dir = self.root / "my-profiles"
         profile_dir.mkdir()
         (profile_dir / "node.yaml").write_text("name: node\n")
-        self._saved_config(profile_directory=str(profile_dir))
+        self._saved_config(profiles_dir=str(profile_dir))
         have, run, names, wait = self._patched_run()
         with have, run, names, wait, mock.patch.object(
             cs, "apply_profiles"
@@ -151,11 +153,37 @@ class UpdateCommandTests(unittest.TestCase):
             io.StringIO()
         ):
             rc = cs.main_update(
-                ["-n", "s", "-profile", "node", "--config-dir", str(self.config_dir)]
+                ["-n", "s", "-profile-policy", "node",
+                 "--config-dir", str(self.config_dir)]
             )
         self.assertEqual(rc, 0)
         self.assertEqual(cs.CONFIG.path, str(self.project))
-        self.assertEqual(cs.CONFIG.profile_directory, str(profile_dir))
+        self.assertEqual(cs.CONFIG.profiles_dir, str(profile_dir))
+
+    def test_a_kit_bearing_profile_is_refused(self):
+        # A kit is a create-time build context; applying it to a live sandbox
+        # would silently do nothing, so the update path refuses it before it
+        # touches the sandbox.
+        profiles = self.root / "profiles"
+        (profiles / "demo" / "kit").mkdir(parents=True)
+        (profiles / "demo" / "profile.yaml").write_text(
+            "name: demo\nkit: kit\npolicies:\n  network:\n    allow:\n      - pypi.org\n"
+        )
+        (profiles / "demo" / "kit" / "demo.yaml").write_text(
+            "# syntax=docker/sandbox-kit:3\nschemaVersion: \"3\"\nkind: mixin\n"
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+            err
+        ), self.assertRaises(SystemExit) as ctx:
+            cs.main_update(
+                ["-n", "s", "-profile-directory", "demo",
+                 "-profiles-dir", str(profiles),
+                 "--dry-run", "--config-dir", str(self.config_dir)]
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("includes a sandbox kit", err.getvalue())
+        self.assertIn("only be used when the sandbox is created", err.getvalue())
 
     def test_a_missing_sandbox_aborts(self):
         err = io.StringIO()
@@ -167,7 +195,7 @@ class UpdateCommandTests(unittest.TestCase):
             err
         ), self.assertRaises(SystemExit) as ctx:
             cs.main_update(
-                ["-n", "s", "-profile", "python",
+                ["-n", "s", "-profile-policy", "python",
                  "--config-dir", str(self.config_dir)]
             )
         self.assertEqual(ctx.exception.code, 1)
@@ -181,7 +209,7 @@ class UpdateCommandTests(unittest.TestCase):
             err
         ), self.assertRaises(SystemExit) as ctx:
             cs.main_update(
-                ["-n", "s", "-profile", "python",
+                ["-n", "s", "-profile-policy", "python",
                  "--config-dir", str(self.config_dir)]
             )
         self.assertEqual(ctx.exception.code, 1)
@@ -195,7 +223,7 @@ class UpdateCommandTests(unittest.TestCase):
             cs, "update_saved_config"
         ), contextlib.redirect_stdout(out):
             rc = cs.main_update(
-                ["-n", "s", "-profile", "python", "--dry-run",
+                ["-n", "s", "-profile-policy", "python", "--dry-run",
                  "--config-dir", str(self.config_dir)]
             )
         self.assertEqual(rc, 0)
@@ -208,7 +236,7 @@ class EntryPointTests(unittest.TestCase):
     """docker-sbx-apply-profile.py: loading the implementation and delegating."""
 
     def test_delegates_argv_to_main_update(self):
-        argv = ["-n", "s", "-profile", "node", "--dry-run"]
+        argv = ["-n", "s", "-profile-policy", "node", "--dry-run"]
         with mock.patch.object(
             ap, "load_create_module", return_value=cs
         ), mock.patch.object(cs, "main_update", return_value=0) as update:

@@ -1,5 +1,6 @@
 prjpath=$1
 envfilepath=${2:-}
+protectedpaths=${3:-true}
 
 # The Python host passes "-" to mean "no env file", so that an empty argument does
 # not have to survive the trip through `sbx exec`.
@@ -338,6 +339,105 @@ install_nctalk_hook() {
   echo "Nextcloud Talk notifications enabled for: $events"
 }
 
+# ----------------------------------------------------------------------
+# Protected paths ------------------------------------------------------
+#
+# A PreToolUse hook blocks the Read/Write/Edit tools and Bash commands that
+# name one of the protected files. It is a guard against accidental access,
+# not a boundary: a variable, a helper script or an obfuscated command can
+# bypass a text match.
+# ----------------------------------------------------------------------
+
+PROTECT_HOOK_MATCHER='Bash|Read|Write|Edit|MultiEdit|NotebookEdit|Grep'
+
+unwire_protected_paths_hook() {
+  local script="$1"
+  local target="$HOME/.claude/settings.json"
+  local tmp
+
+  [[ -f "$target" ]] || return 0
+  tmp="$(mktemp "${target}.tmp.XXXXXX")" || return 1
+  if jq --arg script "$script" '
+      if .hooks.PreToolUse then
+        .hooks.PreToolUse = [
+          .hooks.PreToolUse[]
+          | select(([.hooks[]?.command] | index($script)) == null)
+        ] |
+        if (.hooks.PreToolUse | length) == 0 then del(.hooks.PreToolUse) else . end
+      else . end
+    ' "$target" > "$tmp"; then
+    mv -f "$tmp" "$target"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+wire_protected_paths_hook() {
+  local script="$1"
+  local target="$HOME/.claude/settings.json"
+  local tmp
+
+  if [[ ! -f "$target" ]]; then
+    mkdir -p "$(dirname "$target")"
+    printf '{}\n' > "$target"
+  fi
+  tmp="$(mktemp "${target}.tmp.XXXXXX")" || return 1
+  if jq --arg script "$script" --arg matcher "$PROTECT_HOOK_MATCHER" '
+      .hooks //= {} |
+      .hooks.PreToolUse //= [] |
+      # Replace an older entry for this exact script, so re-running setup does
+      # not accumulate hooks; other PreToolUse hooks are left alone.
+      .hooks.PreToolUse = [
+        .hooks.PreToolUse[]
+        | select(([.hooks[]?.command] | index($script)) == null)
+      ] |
+      .hooks.PreToolUse += [{
+        matcher: $matcher,
+        hooks: [{type: "command", command: $script, timeout: 10}]
+      }]
+    ' "$target" > "$tmp"; then
+    mv -f "$tmp" "$target"
+  else
+    rm -f "$tmp"
+    printf 'Error: could not update %s for the protected-path hook - file left unchanged\n' "$target" >&2
+    return 1
+  fi
+}
+
+install_protected_paths_hook() {
+  local enabled
+  enabled="$(trim_space "${protectedpaths:-true}" | tr '[:upper:]' '[:lower:]')"
+  local hooks_dir="$HOME/.claude/hooks"
+  local installed="$hooks_dir/guard-protected-paths.sh"
+
+  if [[ "$enabled" != "true" ]]; then
+    if [[ -n "$enabled" && "$enabled" != "false" ]]; then
+      echo "Warning: protected paths flag '$enabled' is not true/false - skipping"
+    fi
+    # Make `false` mean "not installed" even if setup is re-run in a sandbox
+    # that once had the hook.
+    unwire_protected_paths_hook "$installed" || true
+    rm -f "$installed"
+    return 0
+  fi
+
+  local stage="$HOME/guard-protected-paths.sh"
+  if [[ ! -f "$stage" ]]; then
+    echo "Warning: $stage not found, skipping protected-path guard"
+    return 0
+  fi
+
+  mkdir -p "$hooks_dir"
+  mv -f "$stage" "$installed"
+  chmod 755 "$installed"
+
+  if ! wire_protected_paths_hook "$installed"; then
+    return 0
+  fi
+  echo "Protected-path guard enabled"
+}
+
 update_claude_code_settings() {
   targetjson=~/.claude/settings.json
 
@@ -437,5 +537,6 @@ install_tools
 update_claude_code_settings
 install_slack_hook
 install_nctalk_hook
+install_protected_paths_hook
 cleanup_env_file
 setup_env

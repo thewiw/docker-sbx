@@ -1,0 +1,23 @@
+name: flutter-sdk
+description: Flutter + Dart + Android SDK toolchain, plus the flutter profile's network access
+# The kit directory is the build context passed to `sbx create --kit`. It is
+# installed into the sandbox image at creation, not copied into ~/.claude.
+kit: flutter
+policies:
+  network:
+    # Keep this list in step with profiles/flutter.yaml. The unit tests assert
+    # the two profiles grant the same hosts, so a new dependency cannot be added
+    # to one and forgotten in the other.
+    allow:
+      # Dart/Flutter package resolution
+      - pub.dev
+      - storage.googleapis.com
+      # Android SDK/Gradle/AGP dependencies
+      - dl.google.com
+      - dl-ssl.google.com
+      - maven.google.com
+      - repo.maven.apache.org
+      - repo1.maven.org
+      - plugins.gradle.org
+      - services.gradle.org
+      - downloads.gradle.org

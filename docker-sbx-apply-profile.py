@@ -2,13 +2,16 @@
 """Apply policy profiles to an existing docker-sbx sandbox.
 
 Usage:
-    python3 docker-sbx-apply-profile.py -n NAME -profile NAMES [-options]
+    python3 docker-sbx-apply-profile.py -n NAME -profile-policy NAMES [-options]
+    python3 docker-sbx-apply-profile.py -n NAME -profile-directory NAMES [-options]
 
     python3 docker-sbx-apply-profile.py --help
 
-Applies the named profiles' network rules and Claude assets to a sandbox that
-already exists, then records them in the sandbox's saved config. It never
-creates a sandbox and never scans the project for secrets.
+Applies the named policy profiles' and/or directory bundles' network rules and
+Claude assets to a sandbox that already exists, then records them in the
+sandbox's saved config. A bundle that carries a kit is refused, because kits are
+built at creation. It never creates a sandbox and never scans the project for
+secrets.
 
 The implementation lives in docker-sbx-create-sandbox.py, next to this file, so
 creation and updates share one profile loader, one asset packer and one config

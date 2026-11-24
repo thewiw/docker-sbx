@@ -1,0 +1,109 @@
+# syntax=docker/sandbox-kit:3
+#
+# Flutter/Dart + Android SDK toolchain, packaged as a v3 sandbox-kit mixin.
+# It is selected by the `flutter-sdk` profile, which passes this directory to
+# `sbx create --kit`. Nothing here is copied into ~/.claude: the Dockerfile
+# builds self-contained SDK trees under /opt, and the final stage is `scratch`.
+schemaVersion: "3"
+kind: mixin
+displayName: Flutter + Dart + Android SDK
+description: Pinned Flutter/Dart SDK, JDK 17 and Android SDK for builds and tests
+version: "1.0.0"
+licenses: [BSD-3-Clause]
+
+provides:
+  - "flutter@${{ kit.args.flutter_version }}"
+  - "android-sdk@${{ kit.args.android_platform }}"
+
+args:
+  flutter_version:
+    default: "3.50.1"
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    buildArg: FLUTTER_VERSION
+  android_platform:
+    default: "36"
+    pattern: '^[0-9]+$'
+    buildArg: ANDROID_PLATFORM
+  android_build_tools:
+    default: "36.0.0"
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    buildArg: BUILD_TOOLS_VERSION
+  cmdline_tools_version:
+    default: "15859902"
+    pattern: '^[0-9]+$'
+    buildArg: CMDLINE_TOOLS_VERSION
+
+capabilities:
+  # Keep the runtime list in step with profiles/flutter.yaml and
+  # profiles/flutter-sdk/profile.yaml. The install list is only for the
+  # fallback hook below, which installs unzip/xz if the base image lacks them.
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      install:
+        allow:
+          - deb.debian.org
+          - security.debian.org
+          - archive.ubuntu.com
+          - security.ubuntu.com
+      runtime:
+        allow:
+          - pub.dev
+          - storage.googleapis.com
+          - dl.google.com
+          - dl-ssl.google.com
+          - maven.google.com
+          - repo.maven.apache.org
+          - repo1.maven.org
+          - plugins.gradle.org
+          - services.gradle.org
+          - downloads.gradle.org
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        - command: |
+            set -eu
+            missing=""
+            for tool in unzip xz clang++ cmake ninja pkg-config; do
+              if ! command -v "$tool" >/dev/null 2>&1; then
+                missing="$missing $tool"
+              fi
+            done
+            if command -v pkg-config >/dev/null 2>&1 \
+               && ! pkg-config --exists gtk+-3.0 2>/dev/null; then
+              missing="$missing libgtk-3-dev"
+            fi
+            if ! command -v eglinfo >/dev/null 2>&1; then
+              missing="$missing mesa-utils"
+            fi
+            if command -v ldconfig >/dev/null 2>&1 \
+               && ! ldconfig -p 2>/dev/null | grep -q 'libGLU\.so'; then
+              missing="$missing libglu1-mesa"
+            fi
+            # The Dart SDK needs libatomic on some builds, and aapt2 needs
+            # libstdc++. Test the actual binaries rather than guessing from the
+            # base image's package list.
+            if ! /opt/flutter/bin/cache/dart-sdk/bin/dart --version >/dev/null 2>&1; then
+              missing="$missing dart-runtime-libs"
+            fi
+            for aapt2 in /opt/android-sdk/build-tools/*/aapt2; do
+              if [ -x "$aapt2" ] && ! "$aapt2" version >/dev/null 2>&1; then
+                missing="$missing aapt2-runtime-libs"
+              fi
+              break
+            done
+            if [ -z "$missing" ]; then
+              exit 0
+            fi
+            if ! command -v apt-get >/dev/null 2>&1; then
+              echo "flutter-sdk: missing$missing and apt-get is unavailable" >&2
+              exit 1
+            fi
+            export DEBIAN_FRONTEND=noninteractive
+            # The guest may still be running its own startup apt; wait for the
+            # dpkg lock instead of failing the whole creation on it.
+            apt-get -o DPkg::Lock::Timeout=120 update
+            apt-get -o DPkg::Lock::Timeout=120 install -y --no-install-recommends \
+              unzip xz-utils libatomic1 libstdc++6 \
+              clang cmake ninja-build pkg-config libgtk-3-dev mesa-utils libglu1-mesa
+          user: "0"
+          description: Ensure Flutter's Android and Linux desktop tools are complete
